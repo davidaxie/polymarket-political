@@ -1,4 +1,4 @@
-from polymarket_insider.backtest.ledger import Trade, simulate_trade, _gross_pnl
+from polymarket_political.backtest.ledger import Trade, simulate_trade, _gross_pnl
 
 
 def test_gross_pnl_basic():

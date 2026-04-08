@@ -9,9 +9,9 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from polymarket_insider.config import SignalConfig
-from polymarket_insider.signal.detector import Event, detect_events
-from polymarket_insider.signal.features import (
+from polymarket_political.config import SignalConfig
+from polymarket_political.signal.detector import Event, detect_events
+from polymarket_political.signal.features import (
     compute_1h_price_move,
     compute_taker_imbalance,
     rolling_hourly_volume,

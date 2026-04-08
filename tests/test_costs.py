@@ -1,11 +1,11 @@
-from polymarket_insider.backtest.costs import (
+from polymarket_political.backtest.costs import (
     apply_fees,
     apply_spread,
     apply_slippage,
     apply_gas,
     total_costs,
 )
-from polymarket_insider.config import CostConfig
+from polymarket_political.config import CostConfig
 
 
 def test_fee_2pct_on_250_winnings():

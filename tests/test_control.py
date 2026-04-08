@@ -1,4 +1,4 @@
-from polymarket_insider.backtest.control import (
+from polymarket_political.backtest.control import (
     generate_control_group,
     quartile_distribution,
 )
