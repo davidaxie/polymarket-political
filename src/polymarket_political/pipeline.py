@@ -92,9 +92,13 @@ def resolve_window(
 class BacktestResult:
     """Typed return value for :func:`run_backtest`.
 
-    ``signal_metrics`` / ``control_metrics`` are both 48h-net-PnL metric
-    summaries (the PRD §6 default horizon). ``config_snapshot`` is a plain
-    dict so the caller can dump it straight to parquet/json for provenance.
+    ``signal_metrics`` is always the news-filtered signal group.
+    ``control_metrics_filtered`` applies the same news filter to the control
+    group so signal-vs-control is an apples-to-apples comparison.
+    ``control_metrics_raw`` is the legacy unfiltered control group kept for
+    transparency. All metric summaries are 48h net PnL (the PRD §6 default
+    horizon). ``config_snapshot`` is a plain dict so the caller can dump it
+    straight to parquet/json for provenance.
     """
 
     window: str
@@ -104,19 +108,35 @@ class BacktestResult:
     events: list[Event]
     ledger: list[Trade]
     control_ledger: list[Trade]
+    control_ledger_raw: list[Trade]
     signal_metrics: MetricsSummary
-    control_metrics: MetricsSummary
+    control_metrics_filtered: MetricsSummary
+    control_metrics_raw: MetricsSummary
     config_snapshot: dict[str, Any]
+    news_filter_applied_to_controls: bool = False
     provisional_label: str = (
         "provisional — mid-price only, fixed-spread cost model"
     )
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def control_metrics(self) -> MetricsSummary:
+        """Deprecated alias — returns :attr:`control_metrics_filtered`.
+
+        Kept so existing notebooks and CLI code keep working. New code should
+        read ``control_metrics_filtered`` (apples-to-apples vs the signal) or
+        ``control_metrics_raw`` (legacy, unfiltered) explicitly.
+        """
+        return self.control_metrics_filtered
 
     def to_ledger_frame(self) -> pd.DataFrame:
         return pd.DataFrame([t.to_dict() for t in self.ledger])
 
     def to_control_ledger_frame(self) -> pd.DataFrame:
         return pd.DataFrame([t.to_dict() for t in self.control_ledger])
+
+    def to_control_ledger_raw_frame(self) -> pd.DataFrame:
+        return pd.DataFrame([t.to_dict() for t in self.control_ledger_raw])
 
     def to_events_frame(self) -> pd.DataFrame:
         return events_to_frame(self.events)
@@ -441,8 +461,32 @@ def run_backtest(
         config=bt_cfg,
     )
 
-    control_ledger: list[Trade] = []
-    for c in control_events:
+    # Build a set of (market_id, hour-floored timestamp) pairs marked as
+    # news windows. When ``news_filter_enabled=True`` this mirrors exactly
+    # what ``detect_events`` drops from the signal group, so we can apply
+    # the same filter to the control group.
+    news_window_pairs: set[tuple[str, pd.Timestamp]] = set()
+    if (
+        sig_cfg.news_filter_enabled
+        and not features_df.empty
+        and "news_window" in features_df.columns
+    ):
+        mask = features_df["news_window"].fillna(False).astype(bool)
+        for row in features_df.loc[mask, ["market_id", "timestamp"]].itertuples(
+            index=False
+        ):
+            ts = pd.Timestamp(row.timestamp)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("UTC")
+            news_window_pairs.add((str(row.market_id), ts.floor("1h")))
+
+    def _is_news_window(market_id: str, ts: pd.Timestamp) -> bool:
+        if not news_window_pairs:
+            return False
+        floor = ts.floor("1h")
+        return (str(market_id), floor) in news_window_pairs
+
+    def _simulate_control(c: dict) -> Trade | None:
         prices = prices_by_market.get(c["market_id"], pd.DataFrame())
         ts = pd.Timestamp(c["entry_ts"], unit="s", tz="UTC")
         pseudo_event = Event(
@@ -454,29 +498,39 @@ def run_backtest(
         )
         entry_price = _entry_price_for_event(pseudo_event, prices)
         if entry_price is None or entry_price <= 0:
-            continue
+            return None
         market_data = _market_data_for_event(pseudo_event, prices)
-        control_ledger.append(
-            simulate_trade_provisional(
-                event={
-                    "event_id": c["event_id"],
-                    "market_id": c["market_id"],
-                    "entry_ts": float(c["entry_ts"]),
-                    "entry_price": entry_price,
-                    "size_usd": bt_cfg.default_size_usd,
-                },
-                market_data=market_data,
-                config=prov_cost_cfg,
-                bt_config=bt_cfg,
-            )
+        return simulate_trade_provisional(
+            event={
+                "event_id": c["event_id"],
+                "market_id": c["market_id"],
+                "entry_ts": float(c["entry_ts"]),
+                "entry_price": entry_price,
+                "size_usd": bt_cfg.default_size_usd,
+            },
+            market_data=market_data,
+            config=prov_cost_cfg,
+            bt_config=bt_cfg,
         )
+
+    control_ledger_raw: list[Trade] = []
+    control_ledger_filtered: list[Trade] = []
+    for c in control_events:
+        trade = _simulate_control(c)
+        if trade is None:
+            continue
+        control_ledger_raw.append(trade)
+        ts = pd.Timestamp(c["entry_ts"], unit="s", tz="UTC")
+        if not _is_news_window(c["market_id"], ts):
+            control_ledger_filtered.append(trade)
 
     # 6. Metrics — default horizon per PRD §6 is 48h net PnL.
     def _pnls(trades: Iterable[Trade]) -> list[float]:
         return [t.pnl_net_48h for t in trades]
 
     signal_metrics = compute_metrics(_pnls(ledger))
-    control_metrics = compute_metrics(_pnls(control_ledger))
+    control_metrics_filtered = compute_metrics(_pnls(control_ledger_filtered))
+    control_metrics_raw = compute_metrics(_pnls(control_ledger_raw))
 
     config_snapshot = {
         "window": window,
@@ -495,9 +549,12 @@ def run_backtest(
         universe_size=universe_size,
         events=events,
         ledger=ledger,
-        control_ledger=control_ledger,
+        control_ledger=control_ledger_filtered,
+        control_ledger_raw=control_ledger_raw,
         signal_metrics=signal_metrics,
-        control_metrics=control_metrics,
+        control_metrics_filtered=control_metrics_filtered,
+        control_metrics_raw=control_metrics_raw,
+        news_filter_applied_to_controls=bool(sig_cfg.news_filter_enabled),
         config_snapshot=config_snapshot,
         warnings=warnings,
     )
@@ -524,7 +581,8 @@ def _cache_result(result: BacktestResult, ing_cfg: IngestConfig) -> None:
 
     metrics_rows = [
         {"group": "signal", **asdict(result.signal_metrics)},
-        {"group": "control", **asdict(result.control_metrics)},
+        {"group": "control_filtered", **asdict(result.control_metrics_filtered)},
+        {"group": "control_raw", **asdict(result.control_metrics_raw)},
     ]
     pd.DataFrame(metrics_rows).to_parquet(
         out_dir / f"metrics_{result.window}.parquet"

@@ -1,16 +1,44 @@
 """Enumerate Polymarket political markets and apply the PRD liquidity floor.
 
-API reference (confirmed via Context7, April 2026):
-    GET https://gamma-api.polymarket.com/markets
-        query params: ``limit``, ``offset``, ``tag_slug``, ``active``, ``closed``,
-        ``start_date_min``, ``end_date_max``, ``order``, ``ascending``.
+API reference (verified live April 2026):
+    The Gamma ``/markets`` endpoint does NOT honour ``tag_slug`` as a filter —
+    passing it returns the entire market universe (~51k rows). Tag information
+    is only attached to *events*, not markets. To filter to political markets
+    we must go through ``/events``:
 
-Notes on the tag filter:
-    Polymarket's Gamma API exposes the tag as a human-readable slug
-    (``politics``). We also check the ``tags`` field on each returned market for
-    a ``Politics`` label as a belt-and-braces guard against a tag-slug rename.
+        GET https://gamma-api.polymarket.com/events
+            query params (verified):
+                ``tag_slug``        — e.g. "politics" (filters server-side)
+                ``closed``          — true/false
+                ``limit``, ``offset``
+                ``end_date_min``    — earliest event end date
+                ``end_date_max``    — latest event end date
+                ``start_date_max``  — latest event start date
+                ``order``, ``ascending``
 
-The raw JSON response is cached to
+    Each event returns a nested ``markets`` array plus a ``tags`` array of
+    ``{id, slug, label}`` objects. We flatten events → markets, copy the event
+    tags onto each child market, and apply the PRD liquidity floor.
+
+Date filter:
+    A market is "active during [start, end]" if its ``endDate`` ≥ ``start``
+    (event hadn't resolved before our window) AND its ``startDate`` ≤ ``end``
+    (event existed by our window close). We push the first half server-side
+    via ``end_date_min=start`` and the second half via ``start_date_max=end``.
+
+Open-interest caveat:
+    Gamma returns ``openInterest`` as ``0`` or ``None`` for every market we
+    looked at. Enforcing the PRD OI ≥ $50k gate against ``None`` would wipe
+    out every political market, so we only apply the OI floor to rows that
+    actually report a positive value. Volume gate is applied unconditionally.
+
+YES token convention (verified live on 2024 Trump/Harris markets):
+    ``outcomes`` and ``clobTokenIds`` are JSON-encoded arrays aligned by index.
+    ``outcomes[0]`` is the "Yes" label and ``clobTokenIds[0]`` is the YES CLOB
+    token id. We store ``token_ids[0]`` = YES, ``token_ids[1]`` = NO, which
+    matches every binary market we inspected.
+
+The resulting frame is cached to
 ``<data_root>/<raw_subdir>/markets_<UTC-timestamp>.parquet`` so re-runs do not
 re-hit the API (PRD §3 — "Everything reproducible").
 """

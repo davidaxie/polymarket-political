@@ -48,6 +48,47 @@ def _format_metrics(m: MetricsSummary) -> str:
     )
 
 
+def _format_signal_vs_control_table(result: BacktestResult) -> str:
+    sig = result.signal_metrics
+    cf = result.control_metrics_filtered
+    cr = result.control_metrics_raw
+    rows = [
+        "| Group | n_trades | hit_rate | mean PnL | total PnL | Sharpe |",
+        "|---|---:|---:|---:|---:|---:|",
+        (
+            f"| Signal (news-filtered) | {sig.n_trades} | "
+            f"{sig.hit_rate:.1%} | ${sig.mean_pnl:.2f} | "
+            f"${sig.total_pnl:.2f} | {sig.sharpe:.2f} |"
+        ),
+        (
+            f"| Control (news-filtered) | {cf.n_trades} | "
+            f"{cf.hit_rate:.1%} | ${cf.mean_pnl:.2f} | "
+            f"${cf.total_pnl:.2f} | {cf.sharpe:.2f} |"
+        ),
+        (
+            f"| Control (raw, legacy) | {cr.n_trades} | "
+            f"{cr.hit_rate:.1%} | ${cr.mean_pnl:.2f} | "
+            f"${cr.total_pnl:.2f} | {cr.sharpe:.2f} |"
+        ),
+    ]
+    table = "\n".join(rows)
+
+    # Material-spread warning: >20% PnL spread between the two controls.
+    warning = ""
+    if result.news_filter_applied_to_controls:
+        denom = max(abs(cr.total_pnl), 1e-9)
+        spread = abs(cf.total_pnl - cr.total_pnl) / denom
+        if spread > 0.20:
+            warning = (
+                "\n\n> ⚠️ **News-filter asymmetry warning.** The filtered and "
+                f"raw control totals differ by {spread:.0%} "
+                f"(filtered=${cf.total_pnl:.2f} vs raw=${cr.total_pnl:.2f}). "
+                "News-filter asymmetry was masking or unmasking apparent edge "
+                "in the signal-vs-control comparison — trust the filtered row."
+            )
+    return table + warning
+
+
 def _gate_recommendation(result: BacktestResult) -> tuple[str, str]:
     """Week 3 gate logic.
 
@@ -62,9 +103,9 @@ def _gate_recommendation(result: BacktestResult) -> tuple[str, str]:
     if sig_n == 0:
         return "red", "No events detected. Thresholds are too strict or ingestion broke."
     sig_mean = result.signal_metrics.mean_pnl
-    ctrl_mean = result.control_metrics.mean_pnl
+    ctrl_mean = result.control_metrics_filtered.mean_pnl
     sig_hit = result.signal_metrics.hit_rate
-    ctrl_hit = result.control_metrics.hit_rate
+    ctrl_hit = result.control_metrics_filtered.hit_rate
     if sig_mean > ctrl_mean and sig_hit >= ctrl_hit:
         return (
             "green",
@@ -141,15 +182,32 @@ def render_report(result: BacktestResult) -> str:
 - Markets after liquidity floor: **{result.universe_size}**
 - Events detected: **{len(result.events)}**
 - Simulated trades (signal): **{len(result.ledger)}**
-- Simulated trades (control): **{len(result.control_ledger)}**
+- Simulated trades (control, filtered): **{len(result.control_ledger)}**
+- Simulated trades (control, raw): **{len(result.control_ledger_raw)}**
 
 ## Signal metrics (48h net PnL, provisional)
 
 {_format_metrics(result.signal_metrics)}
 
-## Control metrics (48h net PnL, provisional)
+## Signal vs Control (two views)
 
-{_format_metrics(result.control_metrics)}
+Two comparisons are reported so the reader can see whether the news-filter
+asymmetry was masking or unmasking edge.
+
+1. **Filtered control** — the same news filter applied to the signal group is
+   also applied to the control group. This is the apples-to-apples comparison.
+2. **Raw control** — the legacy, unfiltered control group. Kept for
+   transparency only.
+
+{_format_signal_vs_control_table(result)}
+
+## Control metrics — filtered (48h net PnL, provisional)
+
+{_format_metrics(result.control_metrics_filtered)}
+
+## Control metrics — raw, unfiltered (48h net PnL, provisional, legacy)
+
+{_format_metrics(result.control_metrics_raw)}
 
 ## Top-5 events (by |Δprice|)
 
@@ -163,8 +221,11 @@ def render_report(result: BacktestResult) -> str:
 
 - Mid-price-only: entry/exit prices are modeled mid-points with no bid/ask depth.
 - Fixed-spread cost model: numbers are indicative, not predictive.
-- Control group is volume-quartile matched random markets + timestamps; no
-  news filter is applied to the control group.
+- Control group is volume-quartile matched random markets + timestamps. When
+  ``SignalConfig.news_filter_enabled`` is True, the same news filter applied
+  to the signal group is also applied to the control group (see "Signal vs
+  Control — two views" above). The raw/unfiltered control is retained for
+  transparency.
 - Per the Research Plan, any parameter tuning based on these results must
   happen on the **training** window only. The holdout stays sealed.
 
