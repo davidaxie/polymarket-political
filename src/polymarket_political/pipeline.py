@@ -157,16 +157,37 @@ def build_features(
     ``[timestamp, market_id, mid_price]`` (from
     :func:`ingest.prices.fetch_price_history`).
     """
+    contract_columns = [
+        "market_id",
+        "timestamp",
+        "volume_1h",
+        "volume_7d_mean",
+        "volume_multiplier",
+        "price_move_1h",
+        "taker_imbalance_1h",
+        "news_window",
+        # Legacy column names retained as aliases so the detector and the
+        # rest of the pipeline keep working.
+        "volume_ratio",
+        "abs_price_move",
+        "imbalance",
+    ]
     if trades.empty and prices.empty:
-        return pd.DataFrame(
-            columns=[
-                "market_id",
-                "timestamp",
-                "volume_ratio",
-                "abs_price_move",
-                "imbalance",
-            ]
-        )
+        empty = pd.DataFrame(columns=contract_columns)
+        empty["timestamp"] = pd.to_datetime(empty["timestamp"], utc=True)
+        empty["news_window"] = empty["news_window"].astype(bool)
+        for col in (
+            "volume_1h",
+            "volume_7d_mean",
+            "volume_multiplier",
+            "price_move_1h",
+            "taker_imbalance_1h",
+            "volume_ratio",
+            "abs_price_move",
+            "imbalance",
+        ):
+            empty[col] = empty[col].astype("float64")
+        return empty
 
     vol = rolling_hourly_volume(trades, window=signal_config.volume_lookback)
 
@@ -202,6 +223,29 @@ def build_features(
     for col in ("volume_ratio", "abs_price_move", "imbalance"):
         if col not in joined.columns:
             joined[col] = float("nan")
+    if "hourly_volume" not in joined.columns:
+        joined["hourly_volume"] = float("nan")
+    if "baseline_volume" not in joined.columns:
+        joined["baseline_volume"] = float("nan")
+
+    # Enforce the public feature contract: tz-aware UTC timestamps,
+    # float64 numerics, plus the canonical column aliases.
+    joined["timestamp"] = pd.to_datetime(joined["timestamp"], utc=True)
+    joined["volume_1h"] = joined["hourly_volume"].astype("float64")
+    joined["volume_7d_mean"] = joined["baseline_volume"].astype("float64")
+    joined["volume_multiplier"] = joined["volume_ratio"].astype("float64")
+    joined["price_move_1h"] = joined["abs_price_move"].astype("float64")
+    joined["taker_imbalance_1h"] = joined["imbalance"].astype("float64")
+    joined["volume_ratio"] = joined["volume_ratio"].astype("float64")
+    joined["abs_price_move"] = joined["abs_price_move"].astype("float64")
+    joined["imbalance"] = joined["imbalance"].astype("float64")
+
+    # ``news_window`` defaults to False so the detector never crashes when no
+    # news data is provided. Callers (e.g. tests) may overwrite the column.
+    if "news_window" not in joined.columns:
+        joined["news_window"] = False
+    joined["news_window"] = joined["news_window"].fillna(False).astype(bool)
+
     joined = joined.sort_values(["market_id", "timestamp"]).reset_index(drop=True)
     return joined
 
