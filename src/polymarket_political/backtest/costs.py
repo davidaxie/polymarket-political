@@ -1,9 +1,86 @@
-"""Cost model: fees, spread, slippage, gas."""
+"""Cost model: fees, spread, slippage, gas.
+
+Two modes:
+
+1. **Real-depth mode** (default) — takes a live orderbook dict with ``bid``/``ask``
+   and a ``depth`` number, and computes spread + linear slippage from them.
+   This is what will be used once Workstream E lands the Polygon subgraph.
+
+2. **Provisional mode** — :class:`ProvisionalCostConfig` pins spread and
+   slippage to FIXED per-trade fractions so the Week-3 backtest can run with
+   only the ``/prices-history`` mid-price series as input (see
+   ``ingest/prices.py``). Metrics produced via this path MUST be labeled
+   "provisional — mid-price only, fixed-spread cost model" in every report.
+"""
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 from ..config import CostConfig
 
 _DEFAULT = CostConfig()
+
+
+# --- Provisional (mid-price-only) cost config ---------------------------------
+
+
+@dataclass(frozen=True)
+class ProvisionalCostConfig:
+    """Fixed-cost overrides used when we only have a mid-price series.
+
+    PROVISIONAL: these numbers are deliberately conservative placeholders. They
+    should be replaced with a depth-aware model (Workstream E) before any
+    result is treated as a live edge estimate.
+
+    Defaults (per the Workstream D spec):
+      - 2¢ round-trip spread (1¢ each side)
+      - 0.5¢ slippage per side
+      - 2% fee + $1 gas from the baseline :class:`CostConfig`
+    """
+
+    fee_rate: float = 0.02
+    gas_cost: float = 1.0
+
+    # spread, expressed in probability units (same scale as mid prices)
+    entry_spread: float = 0.01  # 1¢
+    exit_spread: float = 0.01  # 1¢
+
+    # slippage, as a FRACTION of notional per side (so 0.005 = 0.5%)
+    entry_slippage_frac: float = 0.005
+    exit_slippage_frac: float = 0.005
+
+    label: str = (
+        "provisional — mid-price only, fixed-spread cost model"
+    )
+
+
+def provisional_total_costs(
+    *,
+    size_usd: float,
+    gross_pnl: float,
+    is_resolved: bool,
+    config: ProvisionalCostConfig | None = None,
+) -> dict:
+    """Cost breakdown for the Week-3 mid-price-only backtest path.
+
+    Does NOT take an orderbook dict — we don't have one. Spread is charged per
+    side as a fraction of notional, slippage is fixed per side as a fraction
+    of notional. Same fee/gas as the real-depth path.
+    """
+    cfg = config or ProvisionalCostConfig()
+    spread_cost = (cfg.entry_spread + cfg.exit_spread) * size_usd
+    slippage_cost = (cfg.entry_slippage_frac + cfg.exit_slippage_frac) * size_usd
+    gas = cfg.gas_cost
+    fee = (gross_pnl * cfg.fee_rate) if (is_resolved and gross_pnl > 0) else 0.0
+    return {
+        "spread": spread_cost,
+        "slippage": slippage_cost,
+        "gas": gas,
+        "fee": fee,
+        "total": spread_cost + slippage_cost + gas + fee,
+        "provisional": True,
+        "label": cfg.label,
+    }
 
 
 def apply_fees(pnl: float, is_resolved: bool, config: CostConfig = _DEFAULT) -> float:

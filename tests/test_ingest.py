@@ -18,15 +18,21 @@ from polymarket_political.ingest import (
     MARKETS_SCHEMA,
     NEWS_SCHEMA,
     ORDERBOOK_SCHEMA,
+    PRICES_SCHEMA,
     TRADES_SCHEMA,
     apply_liquidity_floor,
     derive_taker_side,
     fetch_gdelt_headlines,
     fetch_orderbook_snapshots,
     fetch_political_markets,
+    fetch_price_history,
     fetch_trades,
 )
 from polymarket_political.ingest.orderbook import fetch_current_snapshot
+from polymarket_political.ingest.prices import (
+    cache_price_history_parquet,
+    load_or_fetch_price_history,
+)
 
 
 # -------------------------- markets -----------------------------------------
@@ -273,3 +279,112 @@ def test_fetch_gdelt_headlines_maps_articles_and_keyword():
     # Verify the datetime range params use GDELT's compact format.
     assert captured[0]["startdatetime"] == "20251101000000"
     assert captured[0]["enddatetime"] == "20251201000000"
+
+
+# -------------------------- prices / prices-history -------------------------
+
+
+def test_fetch_price_history_schema_and_params(tmp_path):
+    history_payload = {
+        "history": [
+            {"t": 1700000000, "p": 0.41},
+            {"t": 1700003600, "p": 0.42},
+            {"t": 1700007200, "p": 0.45},
+        ]
+    }
+    captured: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/prices-history"
+        captured.append(dict(request.url.params))
+        return httpx.Response(200, json=history_payload)
+
+    cfg = IngestConfig(data_root=str(tmp_path))
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), base_url=cfg.clob_base_url
+    ) as client:
+        df = fetch_price_history(
+            "tok-yes-1",
+            "2023-11-14T00:00:00Z",
+            "2023-11-16T00:00:00Z",
+            interval="1h",
+            config=cfg,
+            client=client,
+        )
+
+    assert len(df) == 3
+    # correct outbound params (market id + required ts bounds + interval)
+    assert captured[0]["market"] == "tok-yes-1"
+    assert captured[0]["interval"] == "1h"
+    assert "startTs" in captured[0] and "endTs" in captured[0]
+    # schema contract
+    assert (df["market_id"] == "tok-yes-1").all()
+    assert df["timestamp"].dt.tz is not None
+    table = pa.Table.from_pandas(df, schema=PRICES_SCHEMA, preserve_index=False)
+    assert table.schema.equals(PRICES_SCHEMA)
+
+
+def test_fetch_price_history_rejects_bad_interval():
+    with pytest.raises(ValueError, match="interval"):
+        fetch_price_history(
+            "tok-yes-1",
+            "2023-11-14",
+            "2023-11-16",
+            interval="bogus",
+        )
+
+
+def test_load_or_fetch_price_history_uses_cache(tmp_path):
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(
+            200, json={"history": [{"t": 1700000000, "p": 0.5}]}
+        )
+
+    cfg = IngestConfig(data_root=str(tmp_path))
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport, base_url=cfg.clob_base_url) as client:
+        df1 = load_or_fetch_price_history(
+            "tok-yes-1",
+            "2023-11-14T00:00:00Z",
+            "2023-11-16T00:00:00Z",
+            config=cfg,
+            client=client,
+        )
+    assert call_count["n"] == 1
+    assert len(df1) == 1
+
+    # Second call: cache hit, no new HTTP call even if we pass a client
+    with httpx.Client(transport=transport, base_url=cfg.clob_base_url) as client:
+        df2 = load_or_fetch_price_history(
+            "tok-yes-1",
+            "2023-11-14T00:00:00Z",
+            "2023-11-16T00:00:00Z",
+            config=cfg,
+            client=client,
+        )
+    assert call_count["n"] == 1  # still 1: cache served
+    assert len(df2) == 1
+
+
+def test_cache_price_history_parquet_roundtrip(tmp_path):
+    df = pd.DataFrame(
+        {
+            "market_id": ["tok-1", "tok-1"],
+            "timestamp": pd.to_datetime(
+                ["2023-11-14T00:00:00Z", "2023-11-14T01:00:00Z"], utc=True
+            ),
+            "mid_price": [0.41, 0.42],
+        }
+    )
+    cfg = IngestConfig(data_root=str(tmp_path))
+    path = cache_price_history_parquet(
+        df, "tok-1", "2023-11-14T00:00:00Z", "2023-11-14T02:00:00Z", config=cfg
+    )
+    assert path.exists()
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path)
+    assert table.schema.equals(PRICES_SCHEMA)
