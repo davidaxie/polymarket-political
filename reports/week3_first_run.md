@@ -34,14 +34,22 @@ sections below. Until then, treat this as a scaffold.
 3. **Universe** — markets after liquidity floor, event count, simulated
    trade counts for signal and control.
 4. **Signal metrics** — 48h net PnL `MetricsSummary` (PRD §6 default horizon).
-5. **Control metrics** — 48h net PnL `MetricsSummary` for the
-   volume-quartile-matched random control group.
-6. **Top-5 events** — biggest `abs_price_move` hits, with `volume_ratio`,
+5. **Signal vs Control (two views)** — side-by-side table comparing the signal
+   against both the news-filtered control (apples-to-apples) and the raw
+   unfiltered control (legacy). A warning is emitted if the two controls
+   differ by more than 20% of total PnL, since that indicates news-filter
+   asymmetry was masking or unmasking apparent edge.
+6. **Control metrics — filtered** — 48h net PnL for the
+   volume-quartile-matched random control group after applying the same news
+   filter used on the signal group.
+7. **Control metrics — raw** — legacy unfiltered control group, kept for
+   transparency.
+8. **Top-5 events** — biggest `abs_price_move` hits, with `volume_ratio`,
    `imbalance`, and timestamp.
-7. **Warnings** — any fetcher failures, skipped events, or empty universe.
-8. **Caveats** — reminders about mid-price-only, fixed spread, and the holdout
-   being sealed.
-9. **Week 3 Gate Recommendation** — 🟢 / 🟡 / 🔴 per the Research Plan.
+9. **Warnings** — any fetcher failures, skipped events, or empty universe.
+10. **Caveats** — reminders about mid-price-only, fixed spread, and the holdout
+    being sealed.
+11. **Week 3 Gate Recommendation** — 🟢 / 🟡 / 🔴 per the Research Plan.
 
 ## Week 3 gate logic (from RESEARCH_PLAN.md)
 
@@ -59,4 +67,5 @@ The CLI implements this as:
 
 - `ledger_training.parquet` — every simulated signal trade.
 - `control_ledger_training.parquet` — every simulated control trade.
-- `metrics_training.parquet` — the two `MetricsSummary` rows.
+- `metrics_training.parquet` — `signal`, `control_filtered`, and
+  `control_raw` `MetricsSummary` rows.

@@ -200,6 +200,102 @@ def test_run_backtest_empty_universe_returns_empty_metrics(tmp_path):
     assert any("Empty" in w or "empty" in w for w in result.warnings)
 
 
+def test_news_filter_applied_to_controls_symmetrically(tmp_path, monkeypatch):
+    """When news_filter_enabled=True, controls get the same filter as the signal.
+
+    We inject a ``news_window`` column into the feature frame for M2 around
+    the timestamps the control generator is likely to draw, so at least one
+    control event should land in a news window and be dropped from the
+    filtered control set (but not the raw set).
+    """
+    from polymarket_political import pipeline as pipeline_mod
+
+    ingest_cfg = IngestConfig(data_root=str(tmp_path))
+    signal_cfg = SignalConfig(
+        volume_lookback="7d",
+        volume_multiplier=3.0,
+        price_move_threshold=0.05,
+        taker_imbalance_threshold=0.6,
+        news_filter_enabled=True,
+    )
+
+    real_build_features = pipeline_mod.build_features
+
+    def build_features_with_news(trades, prices, sig_cfg):
+        df = real_build_features(trades, prices, sig_cfg)
+        if df.empty:
+            return df
+        df = df.copy()
+        # Mark every M2 row as a news window, and every non-spike M1 row
+        # (anything before day 10). The M1 spike hour stays unmarked so the
+        # signal detector still fires an event. Controls that land on any
+        # marked (market_id, hour) pair — which is most of the timestamp
+        # pool — should be dropped from the filtered control set, leaving
+        # it strictly smaller than the raw control set.
+        is_m2 = df["market_id"] == "M2"
+        spike_hour = pd.Timestamp("2025-11-11T05:00:00Z")
+        is_old_m1 = (df["market_id"] == "M1") & (df["timestamp"] < spike_hour)
+        df["news_window"] = (is_m2 | is_old_m1).astype(bool)
+        return df
+
+    monkeypatch.setattr(pipeline_mod, "build_features", build_features_with_news)
+
+    result = run_backtest(
+        window="training",
+        signal_config=signal_cfg,
+        ingest_config=ingest_cfg,
+        markets_fetcher=lambda s, e, **kw: _canned_markets(),
+        trades_fetcher=lambda mid, s, e, **kw: _canned_trades(mid.replace("0x", "")),
+        prices_fetcher=lambda tok, s, e, **kw: _canned_prices(tok),
+        cost_config=ProvisionalCostConfig(),
+        cache_intermediate=False,
+    )
+
+    assert result.news_filter_applied_to_controls is True
+    # Both control metrics are computed.
+    assert isinstance(result.control_metrics_filtered, MetricsSummary)
+    assert isinstance(result.control_metrics_raw, MetricsSummary)
+    # Filtered control has strictly fewer trades than the raw one because
+    # every feature row is inside a news window.
+    assert result.control_metrics_raw.n_trades > 0
+    assert result.control_metrics_filtered.n_trades < result.control_metrics_raw.n_trades
+    # Backwards-compatible alias still works.
+    assert result.control_metrics is result.control_metrics_filtered
+
+
+def test_news_filter_disabled_yields_identical_control_metrics(tmp_path):
+    """When news_filter_enabled=False the two control metrics must match."""
+    ingest_cfg = IngestConfig(data_root=str(tmp_path))
+    signal_cfg = SignalConfig(
+        volume_lookback="7d",
+        volume_multiplier=3.0,
+        price_move_threshold=0.05,
+        taker_imbalance_threshold=0.6,
+        news_filter_enabled=False,
+    )
+
+    result = run_backtest(
+        window="training",
+        signal_config=signal_cfg,
+        ingest_config=ingest_cfg,
+        markets_fetcher=lambda s, e, **kw: _canned_markets(),
+        trades_fetcher=lambda mid, s, e, **kw: _canned_trades(mid.replace("0x", "")),
+        prices_fetcher=lambda tok, s, e, **kw: _canned_prices(tok),
+        cost_config=ProvisionalCostConfig(),
+        cache_intermediate=False,
+    )
+
+    assert result.news_filter_applied_to_controls is False
+    assert (
+        result.control_metrics_filtered.n_trades
+        == result.control_metrics_raw.n_trades
+    )
+    assert (
+        result.control_metrics_filtered.total_pnl
+        == result.control_metrics_raw.total_pnl
+    )
+
+
 def test_build_features_handles_empty_inputs():
     sig_cfg = SignalConfig()
     out = build_features(pd.DataFrame(), pd.DataFrame(), sig_cfg)
