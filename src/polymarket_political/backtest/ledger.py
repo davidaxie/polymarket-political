@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any
 
 from ..config import BacktestConfig, CostConfig
-from .costs import total_costs
+from .costs import ProvisionalCostConfig, provisional_total_costs, total_costs
 
 _DEFAULT_COST = CostConfig()
 _DEFAULT_BT = BacktestConfig()
@@ -106,6 +106,73 @@ def simulate_trade(
         gross_pnl=gross_res,
         is_resolved=is_resolved,
         config=config,
+    )
+
+    return Trade(
+        event_id=event["event_id"],
+        market_id=event["market_id"],
+        entry_ts=float(event["entry_ts"]),
+        entry_price=entry_price,
+        size_usd=size_usd,
+        exit_24h=e24,
+        exit_48h=e48,
+        exit_72h=e72,
+        exit_resolution=eres,
+        pnl_gross_24h=gross_24,
+        pnl_gross_48h=gross_48,
+        pnl_gross_72h=gross_72,
+        pnl_gross_resolution=gross_res,
+        pnl_net_24h=gross_24 - non_fee,
+        pnl_net_48h=gross_48 - non_fee,
+        pnl_net_72h=gross_72 - non_fee,
+        pnl_net_resolution=gross_res - res_costs["total"],
+        is_resolved=is_resolved,
+        cost_breakdown=res_costs,
+    )
+
+
+def simulate_trade_provisional(
+    event: dict,
+    market_data: dict,
+    config: ProvisionalCostConfig | None = None,
+    bt_config: BacktestConfig = _DEFAULT_BT,
+) -> Trade:
+    """Mid-price-only variant of :func:`simulate_trade`.
+
+    Uses :class:`ProvisionalCostConfig` — NO orderbook is consulted. Required
+    keys in ``market_data``: ``exit_24h``, ``exit_48h``, ``exit_72h``,
+    ``exit_resolution`` (any may be ``None``), ``is_resolved``.
+
+    PROVISIONAL: any PnL this function produces must be labeled accordingly.
+    """
+    cfg = config or ProvisionalCostConfig()
+    size_usd = event.get("size_usd", bt_config.default_size_usd)
+    entry_price = float(event["entry_price"])
+
+    e24 = market_data.get("exit_24h")
+    e48 = market_data.get("exit_48h")
+    e72 = market_data.get("exit_72h")
+    eres = market_data.get("exit_resolution")
+
+    gross_24 = _gross_pnl(entry_price, e24, size_usd) if e24 is not None else 0.0
+    gross_48 = _gross_pnl(entry_price, e48, size_usd) if e48 is not None else 0.0
+    gross_72 = _gross_pnl(entry_price, e72, size_usd) if e72 is not None else 0.0
+    gross_res = _gross_pnl(entry_price, eres, size_usd) if eres is not None else 0.0
+
+    is_resolved = bool(market_data.get("is_resolved", False))
+
+    base = provisional_total_costs(
+        size_usd=size_usd,
+        gross_pnl=0.0,
+        is_resolved=False,
+        config=cfg,
+    )
+    non_fee = base["total"]
+    res_costs = provisional_total_costs(
+        size_usd=size_usd,
+        gross_pnl=gross_res,
+        is_resolved=is_resolved,
+        config=cfg,
     )
 
     return Trade(

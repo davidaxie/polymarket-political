@@ -16,18 +16,28 @@ from .markets import (
 )
 from .news import NEWS_SCHEMA, fetch_gdelt_headlines
 from .orderbook import ORDERBOOK_SCHEMA, fetch_orderbook_snapshots
+from .prices import (
+    PRICES_SCHEMA,
+    cache_price_history_parquet,
+    fetch_price_history,
+    load_or_fetch_price_history,
+)
 from .trades import TRADES_SCHEMA, derive_taker_side, fetch_trades
 
 __all__ = [
     "MARKETS_SCHEMA",
     "NEWS_SCHEMA",
     "ORDERBOOK_SCHEMA",
+    "PRICES_SCHEMA",
     "TRADES_SCHEMA",
     "apply_liquidity_floor",
+    "cache_price_history_parquet",
     "derive_taker_side",
     "fetch_gdelt_headlines",
     "fetch_orderbook_snapshots",
     "fetch_political_markets",
+    "fetch_price_history",
     "fetch_trades",
     "list_political_markets",
+    "load_or_fetch_price_history",
 ]
