@@ -224,3 +224,41 @@ def test_detector_is_deterministic(df):
     a = detect_events(df.copy(), cfg)
     b = detect_events(df.copy(), cfg)
     assert a == b
+
+
+def test_detect_events_cold_start():
+    """A market with <7d of history must NOT fire events and must not crash.
+
+    The rolling 7d baseline is undefined for the first hours, so volume_ratio
+    is NaN — the detector should drop those rows cleanly via dropna() rather
+    than blowing up on a NaN comparison.
+    """
+    from datetime import datetime, timezone
+
+    from polymarket_political.config import SignalConfig
+    from polymarket_political.pipeline import build_features
+    from polymarket_political.signal.detector import detect_events
+    from tests.fixtures.synthetic_market_data import make_synthetic_market
+
+    start = datetime(2025, 11, 1, 0, 0, 0, tzinfo=timezone.utc)
+    end = datetime(2025, 11, 1, 6, 0, 0, tzinfo=timezone.utc)  # 6 hours only
+    trades, prices = make_synthetic_market(
+        market_id="COLD",
+        start=start,
+        end=end,
+        seed=21,
+        volume_spike_at=None,
+        n_trades=200,
+    )
+
+    sig_cfg = SignalConfig(
+        volume_lookback="7d",
+        volume_multiplier=3.0,
+        price_move_threshold=0.05,
+        taker_imbalance_threshold=0.6,
+        news_filter_enabled=False,
+    )
+    features = build_features(trades, prices, sig_cfg)
+    # Detector must not raise on NaN-volume_ratio rows.
+    events = detect_events(features, sig_cfg)
+    assert events == []
