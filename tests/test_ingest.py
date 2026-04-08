@@ -377,7 +377,10 @@ def test_fetch_price_history_schema_and_params(tmp_path):
     assert len(df) == 3
     # correct outbound params (market id + required ts bounds + interval)
     assert captured[0]["market"] == "tok-yes-1"
-    assert captured[0]["interval"] == "1h"
+    # With a time range set, Polymarket treats `interval` and `startTs/endTs`
+    # as mutually exclusive, so we send `fidelity` (minutes) instead.
+    assert "interval" not in captured[0]
+    assert captured[0]["fidelity"] == "60"
     assert "startTs" in captured[0] and "endTs" in captured[0]
     # schema contract
     assert (df["market_id"] == "tok-yes-1").all()

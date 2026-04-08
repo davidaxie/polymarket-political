@@ -130,17 +130,28 @@ def fetch_price_history(
     url = base_url or cfg.clob_base_url
     client = client or httpx.Client(base_url=url, timeout=cfg.request_timeout_sec)
 
-    start_ts = int(pd.Timestamp(start, tz="UTC").timestamp())
-    end_ts = int(pd.Timestamp(end, tz="UTC").timestamp())
+    start_ts = int(_as_utc_ts(start).timestamp())
+    end_ts = int(_as_utc_ts(end).timestamp())
 
+    # NOTE: Polymarket's /prices-history endpoint treats `interval` and
+    # `startTs/endTs` as mutually exclusive. Passing both returns {"history":[]}.
+    # When a time range is supplied we drop `interval` and rely on `fidelity`
+    # (minute grid spacing) for sampling. `interval` is kept around for legacy
+    # "last 1h/1d/1w" style pulls where no explicit range is needed.
     params: dict[str, Any] = {
         "market": market_id,
         "startTs": start_ts,
         "endTs": end_ts,
-        "interval": interval,
+    }
+    # Convert our requested interval to an approximate fidelity (minutes).
+    # This is the closest thing the API supports when a time range is set.
+    interval_to_fidelity_min = {
+        "1m": 1, "1h": 60, "6h": 360, "1d": 1440, "1w": 10080,
     }
     if fidelity is not None:
         params["fidelity"] = int(fidelity)
+    elif interval in interval_to_fidelity_min:
+        params["fidelity"] = interval_to_fidelity_min[interval]
 
     try:
         resp = client.get("/prices-history", params=params)
@@ -154,16 +165,22 @@ def fetch_price_history(
     df = _to_prices_frame((_row_from_point(market_id, p) for p in history), market_id)
 
     if not df.empty:
-        lo = pd.Timestamp(start, tz="UTC")
-        hi = pd.Timestamp(end, tz="UTC")
+        lo = _as_utc_ts(start)
+        hi = _as_utc_ts(end)
         df = df[(df["timestamp"] >= lo) & (df["timestamp"] <= hi)].reset_index(
             drop=True
         )
     return df
 
 
+def _as_utc_ts(value: datetime | str | int | float) -> pd.Timestamp:
+    """Coerce naive or tz-aware input to a UTC ``pd.Timestamp``."""
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
 def _safe_stamp(value: datetime | str) -> str:
-    return pd.Timestamp(value, tz="UTC").strftime("%Y%m%dT%H%M%SZ")
+    return _as_utc_ts(value).strftime("%Y%m%dT%H%M%SZ")
 
 
 def cache_price_history_parquet(

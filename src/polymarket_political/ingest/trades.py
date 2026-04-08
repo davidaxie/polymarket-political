@@ -55,6 +55,12 @@ def derive_taker_side(trade: dict[str, Any]) -> str:
     return ""
 
 
+def _as_utc_ts(value: Any) -> pd.Timestamp:
+    """Coerce naive or tz-aware input to a UTC ``pd.Timestamp``."""
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
 def _parse_ts(value: Any) -> pd.Timestamp | None:
     if value in (None, "", 0):
         return None
@@ -118,46 +124,87 @@ def fetch_trades(
 ) -> pd.DataFrame:
     """Pull the full trade tape for ``market_id`` between ``start`` and ``end``.
 
-    Returns a frame matching ``TRADES_SCHEMA``. Pagination uses the offset
-    pattern advertised by the Data API; we stop once the API returns fewer
-    records than ``page_size``.
+    Returns a frame matching ``TRADES_SCHEMA``.
+
+    IMPORTANT: Polymarket's /trades endpoint caps offset-based pagination at
+    3000 records per query. For high-volume markets (Trump 2024 election had
+    hundreds of thousands of trades) offset paging alone is insufficient —
+    the server returns ``{"error":"max historical activity offset of 3000
+    exceeded"}`` with HTTP 400 once you page past it.
+
+    To get the full tape we recursively bisect the time window whenever a
+    window fills its offset cap, until each chunk fits under the cap. This
+    costs extra HTTP calls on busy markets but is the only correct strategy
+    Polymarket supports today.
     """
     cfg = config or IngestConfig()
     owns_client = client is None
     client = client or httpx.Client(base_url=base_url, timeout=cfg.request_timeout_sec)
-    start_ts = int(pd.Timestamp(start, tz="UTC").timestamp())
-    end_ts = int(pd.Timestamp(end, tz="UTC").timestamp())
+    start_ts = int(_as_utc_ts(start).timestamp())
+    end_ts = int(_as_utc_ts(end).timestamp())
 
+    MAX_OFFSET = 3000  # Polymarket hard cap
     rows: list[dict[str, Any]] = []
-    offset = 0
-    try:
+
+    def _pull_window(lo_ts: int, hi_ts: int) -> None:
+        """Try to drain a single [lo,hi] window; bisect if we hit the cap."""
+        if hi_ts <= lo_ts:
+            return
+        offset = 0
+        window_rows: list[dict[str, Any]] = []
         while True:
             params = {
                 "market": market_id,
-                "startTs": start_ts,
-                "endTs": end_ts,
+                "startTs": lo_ts,
+                "endTs": hi_ts,
                 "limit": cfg.page_size,
                 "offset": offset,
             }
             resp = client.get("/trades", params=params)
+            if resp.status_code == 400 and "offset" in resp.text.lower():
+                # Window is too dense — split in half and retry both sides
+                mid = (lo_ts + hi_ts) // 2
+                if mid == lo_ts:
+                    # Can't subdivide further (1-second window); give up
+                    # on the rest rather than loop forever.
+                    break
+                rows.extend(window_rows)
+                _pull_window(lo_ts, mid)
+                _pull_window(mid, hi_ts)
+                return
             resp.raise_for_status()
             payload = resp.json()
             batch = payload if isinstance(payload, list) else payload.get("data", [])
             if not batch:
                 break
-            rows.extend(batch)
+            window_rows.extend(batch)
             if len(batch) < cfg.page_size:
                 break
             offset += cfg.page_size
+            if offset >= MAX_OFFSET:
+                # Next request would hit the cap — proactively bisect
+                mid = (lo_ts + hi_ts) // 2
+                if mid == lo_ts:
+                    break
+                rows.extend(window_rows)
+                _pull_window(lo_ts, mid)
+                _pull_window(mid, hi_ts)
+                return
+        rows.extend(window_rows)
+
+    try:
+        _pull_window(start_ts, end_ts)
     finally:
         if owns_client:
             client.close()
 
     df = _to_trades_frame(_row_from_trade(r) for r in rows)
     if not df.empty:
-        lo = pd.Timestamp(start, tz="UTC")
-        hi = pd.Timestamp(end, tz="UTC")
+        lo = _as_utc_ts(start)
+        hi = _as_utc_ts(end)
         df = df[(df["timestamp"] >= lo) & (df["timestamp"] <= hi)].reset_index(
             drop=True
         )
+        # Bisection may have produced overlapping calls; dedupe by trade_id.
+        df = df.drop_duplicates(subset=["trade_id"]).reset_index(drop=True)
     return df
