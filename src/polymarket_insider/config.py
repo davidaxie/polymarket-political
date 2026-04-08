@@ -54,5 +54,42 @@ class BacktestConfig(BaseSettings):
     random_seed: int = 42
 
 
+class IngestConfig(BaseSettings):
+    """Data-ingestion parameters — API hosts, liquidity floor, rate limits, paths.
+
+    Overridable via env vars prefixed ``PMI_INGEST_``
+    (e.g. ``PMI_INGEST_MIN_VOLUME=250000``).
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PMI_INGEST_", extra="ignore")
+
+    # API hosts (PRD §8)
+    gamma_base_url: str = "https://gamma-api.polymarket.com"
+    clob_base_url: str = "https://clob.polymarket.com"
+    gdelt_base_url: str = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+    # Tag filter (PRD §4.1) — Polymarket "Politics" tag
+    political_tag_slug: str = "politics"
+    political_tag_label: str = "Politics"
+
+    # Liquidity floor (PRD §4.1 — cumulative lifetime vol ≥ $500k, OI ≥ $50k)
+    min_volume: float = 500_000.0
+    min_open_interest: float = 50_000.0
+
+    # Rate-limit knobs (Polymarket does not publish a formal limit — be conservative)
+    requests_per_second: float = 5.0
+    request_timeout_sec: float = 30.0
+    max_retries: int = 3
+    page_size: int = 500  # /gamma/markets limit per page
+
+    # GDELT caps at 250 records per DOC-API call
+    gdelt_max_records: int = 250
+
+    # Data paths
+    data_root: str = "data"
+    raw_subdir: str = "raw"
+    processed_subdir: str = "processed"
+
+
 # Backwards-compat alias used by the signal detector.
 Config = SignalConfig
