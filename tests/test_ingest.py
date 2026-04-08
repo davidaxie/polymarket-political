@@ -13,8 +13,8 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
-from polymarket_insider.config import IngestConfig
-from polymarket_insider.ingest import (
+from polymarket_political.config import IngestConfig
+from polymarket_political.ingest import (
     MARKETS_SCHEMA,
     NEWS_SCHEMA,
     ORDERBOOK_SCHEMA,
@@ -26,7 +26,7 @@ from polymarket_insider.ingest import (
     fetch_political_markets,
     fetch_trades,
 )
-from polymarket_insider.ingest.orderbook import fetch_current_snapshot
+from polymarket_political.ingest.orderbook import fetch_current_snapshot
 
 
 # -------------------------- markets -----------------------------------------

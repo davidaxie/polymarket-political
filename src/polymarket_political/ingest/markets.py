@@ -236,7 +236,7 @@ def cache_markets_parquet(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="python -m polymarket_insider.ingest.markets",
+        prog="python -m polymarket_political.ingest.markets",
         description="Fetch political markets from Polymarket Gamma API and cache as parquet.",
     )
     p.add_argument("--start", default="2025-10-08", help="UTC start date (YYYY-MM-DD)")

@@ -67,7 +67,7 @@ Schemas are defined in code and tested via `pyarrow.Schema.equals`:
 - `NEWS_SCHEMA` — GDELT ArtList rows plus the originating `market_id` and
   `keyword` for attribution.
 
-See `src/polymarket_insider/ingest/*.py` for the authoritative definitions.
+See `src/polymarket_political/ingest/*.py` for the authoritative definitions.
 
 ## 5. Orderbook reconstruction risk (PRIMARY WEEK 1 RISK)
 
@@ -127,7 +127,7 @@ PRD §4 and PRD §7. Notable fields:
 
 ## 8. Worked example — acceptance test
 
-The markets CLI (`python -m polymarket_insider.ingest.markets --help`)
+The markets CLI (`python -m polymarket_political.ingest.markets --help`)
 accepts `--start`, `--end`, and `--apply-floor`. Default window is the
 full 6-month range from the Research Plan (2025-10-08 → 2026-04-08). A
 successful run writes `data/raw/markets_<UTC timestamp>.parquet` and

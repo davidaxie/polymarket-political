@@ -1,6 +1,6 @@
 import math
 
-from polymarket_insider.report.metrics import compute_metrics, MetricsSummary
+from polymarket_political.report.metrics import compute_metrics, MetricsSummary
 
 
 def test_metrics_empty():

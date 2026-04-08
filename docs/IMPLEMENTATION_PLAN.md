@@ -18,9 +18,9 @@
 ## Repo Layout
 
 ```
-polymarket-insider/
+polymarket-political/
 ├── docs/                          # PRD, research plan, this file, weekly reports
-├── src/polymarket_insider/
+├── src/polymarket_political/
 │   ├── __init__.py
 │   ├── config.py                  # Thresholds, windows, paths (pydantic)
 │   ├── ingest/
@@ -81,7 +81,7 @@ Use the `superpowers:dispatching-parallel-agents` skill (listed in session conte
 **Owner:** subagent A
 
 ### Tasks
-1. Set up `pyproject.toml` with deps, `uv sync`, `src/polymarket_insider/__init__.py`
+1. Set up `pyproject.toml` with deps, `uv sync`, `src/polymarket_political/__init__.py`
 2. Write `config.py` with pydantic settings for the PRD thresholds (one place to change them)
 3. `ingest/markets.py`:
    - `list_political_markets(start, end) -> DataFrame` — hit Polymarket `/markets` endpoint, filter by tag + date range
@@ -96,7 +96,7 @@ Use the `superpowers:dispatching-parallel-agents` skill (listed in session conte
 
 ### Deliverable
 Branch mergeable to `main` with:
-- Working `python -m polymarket_insider.ingest.markets` CLI that produces a parquet file
+- Working `python -m polymarket_political.ingest.markets` CLI that produces a parquet file
 - All tests passing
 - Week 1 report draft in `reports/week1_data_feasibility.md`
 
@@ -165,7 +165,7 @@ Runs after A + B + C are merged to `main`.
 ### Tasks
 1. Wire the pipeline end-to-end: markets → orderbooks/trades → features → events → trades → metrics
 2. Write `notebooks/03_backtest_first_run.ipynb` following Research Plan Week 3
-3. Add CLI: `python -m polymarket_insider.backtest run --window training` → produces a report
+3. Add CLI: `python -m polymarket_political.backtest run --window training` → produces a report
 4. Iterate per Research Plan Weeks 3–5
 
 ---
