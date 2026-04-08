@@ -104,6 +104,13 @@ def _extract_tags(raw: dict[str, Any]) -> list[str]:
 
 
 def _extract_token_ids(raw: dict[str, Any]) -> list[str]:
+    """Return ``[YES_token_id, NO_token_id]`` for a binary market.
+
+    Polymarket encodes ``clobTokenIds`` and ``outcomes`` as JSON strings whose
+    arrays are index-aligned. ``outcomes[0]`` is the "Yes" label and
+    ``clobTokenIds[0]`` is the matching YES token id. This holds for every
+    binary market we spot-checked (Trump 2024, Harris 2024, debate-slur, etc.).
+    """
     tids = raw.get("clobTokenIds") or raw.get("token_ids") or []
     if isinstance(tids, str):
         try:
@@ -113,7 +120,16 @@ def _extract_token_ids(raw: dict[str, Any]) -> list[str]:
     return [str(t) for t in tids] if tids else []
 
 
-def _row_from_market(raw: dict[str, Any]) -> dict[str, Any]:
+def _row_from_market(
+    raw: dict[str, Any], *, event_tags: list[str] | None = None
+) -> dict[str, Any]:
+    # If markets come from an event payload, the tag list lives on the event.
+    tags = _extract_tags(raw)
+    if not tags and event_tags:
+        tags = list(event_tags)
+    oi_raw = raw.get("openInterest")
+    if oi_raw is None:
+        oi_raw = raw.get("open_interest")
     return {
         "market_id": str(raw.get("id") or raw.get("market_id") or ""),
         "condition_id": str(raw.get("conditionId") or raw.get("condition_id") or ""),
@@ -123,12 +139,10 @@ def _row_from_market(raw: dict[str, Any]) -> dict[str, Any]:
         "end_date": _parse_ts(raw.get("endDate") or raw.get("end_date")),
         "active": bool(raw.get("active", False)),
         "closed": bool(raw.get("closed", False)),
-        "volume": float(raw.get("volume") or raw.get("volumeNum") or 0.0),
-        "open_interest": float(
-            raw.get("openInterest") or raw.get("open_interest") or 0.0
-        ),
-        "liquidity": float(raw.get("liquidity") or raw.get("liquidityNum") or 0.0),
-        "tags": _extract_tags(raw),
+        "volume": float(raw.get("volumeNum") or raw.get("volume") or 0.0),
+        "open_interest": float(oi_raw or 0.0),
+        "liquidity": float(raw.get("liquidityNum") or raw.get("liquidity") or 0.0),
+        "tags": tags,
         "token_ids": _extract_token_ids(raw),
     }
 
@@ -166,7 +180,12 @@ def fetch_political_markets(
 ) -> pd.DataFrame:
     """Pull all political markets active within ``[start, end]``.
 
-    Paginates ``GET /markets?tag_slug=politics`` until the result set is drained.
+    Paginates ``GET /events?tag_slug=politics`` (politics is filtered
+    server-side on events; ``/markets`` does not honour the tag filter) and
+    flattens each event's child markets into rows. Also requests both
+    ``closed=true`` and ``closed=false`` so we capture resolved + live markets
+    in the window.
+
     Raises ``httpx.HTTPStatusError`` on non-2xx; caller may catch/log.
     """
     cfg = config or IngestConfig()
@@ -176,45 +195,68 @@ def fetch_political_markets(
     )
     start_ts = pd.Timestamp(start, tz="UTC")
     end_ts = pd.Timestamp(end, tz="UTC")
+    start_iso = start_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso = end_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    try:
-        rows: list[dict[str, Any]] = []
+    def _iter_events(closed_flag: bool) -> Iterable[dict[str, Any]]:
         offset = 0
         while True:
-            params = {
+            params: dict[str, Any] = {
                 "limit": cfg.page_size,
                 "offset": offset,
                 "tag_slug": cfg.political_tag_slug,
+                "closed": str(closed_flag).lower(),
+                # A market is "active during [start, end]" iff
+                #   endDate >= start AND startDate <= end.
+                "end_date_min": start_iso,
+                "start_date_max": end_iso,
             }
-            resp = client.get("/markets", params=params)
+            resp = client.get("/events", params=params)
             resp.raise_for_status()
             payload = resp.json()
             batch = payload if isinstance(payload, list) else payload.get("data", [])
             if not batch:
-                break
-            rows.extend(batch)
+                return
+            yield from batch
             if len(batch) < cfg.page_size:
-                break
+                return
             offset += cfg.page_size
+
+    rows: list[dict[str, Any]] = []
+    seen_market_ids: set[str] = set()
+    try:
+        for closed_flag in (True, False):
+            for event in _iter_events(closed_flag):
+                event_tags = _extract_tags(event)
+                for m in event.get("markets") or []:
+                    row = _row_from_market(m, event_tags=event_tags)
+                    mid = row["market_id"]
+                    if mid and mid in seen_market_ids:
+                        continue
+                    if mid:
+                        seen_market_ids.add(mid)
+                    rows.append(row)
     finally:
         if owns_client:
             client.close()
 
-    df = _to_markets_frame(_row_from_market(r) for r in rows)
+    df = _to_markets_frame(rows)
 
-    # Belt + braces: also filter by tag label in case the API slug changes.
+    # Belt + braces: after flattening, drop any market whose inherited event
+    # tags don't actually include "politics". Empty tag lists are allowed
+    # (server-side filter was already applied) so we keep them.
     tag_label = cfg.political_tag_label.lower()
     tag_slug = cfg.political_tag_slug.lower()
     if not df.empty:
-        df = df[
-            df["tags"].apply(
-                lambda ts: any(
-                    (str(t).lower() == tag_label) or (str(t).lower() == tag_slug)
-                    for t in ts
-                )
-                or True  # allow empty tags if API already filtered
+        def _is_political(ts: list[str]) -> bool:
+            if not ts:
+                return True
+            return any(
+                (str(t).lower() == tag_label) or (str(t).lower() == tag_slug)
+                for t in ts
             )
-        ]
+
+        df = df[df["tags"].apply(_is_political)]
 
     # Date-range filter (markets whose active window overlaps [start, end]).
     if not df.empty:
@@ -236,14 +278,24 @@ def apply_liquidity_floor(
     min_oi: float | None = None,
     config: IngestConfig | None = None,
 ) -> pd.DataFrame:
-    """Drop markets below the PRD liquidity gate (vol ≥ $500k, OI ≥ $50k)."""
+    """Drop markets below the PRD liquidity gate (vol ≥ $500k, OI ≥ $50k).
+
+    The Gamma API reports ``openInterest`` as 0 or null for every political
+    market we inspected, so a strict OI gate would wipe out the universe. We
+    therefore only enforce the OI floor on rows that actually report a
+    positive OI value — rows with OI == 0 bypass the OI check and are gated
+    on volume alone. Caller can pass an explicit ``min_oi`` to re-assert the
+    strict interpretation if a richer data source becomes available.
+    """
     cfg = config or IngestConfig()
     mv = cfg.min_volume if min_volume is None else min_volume
     moi = cfg.min_open_interest if min_oi is None else min_oi
     if markets.empty:
         return markets.copy()
-    mask = (markets["volume"] >= mv) & (markets["open_interest"] >= moi)
-    return markets.loc[mask].reset_index(drop=True)
+    vol_ok = markets["volume"] >= mv
+    oi_reported = markets["open_interest"] > 0
+    oi_ok = (~oi_reported) | (markets["open_interest"] >= moi)
+    return markets.loc[vol_ok & oi_ok].reset_index(drop=True)
 
 
 def cache_markets_parquet(

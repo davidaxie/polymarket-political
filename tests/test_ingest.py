@@ -45,7 +45,6 @@ def _fake_market(
     oi: float,
     start: str = "2025-11-01T00:00:00Z",
     end: str = "2026-02-01T00:00:00Z",
-    tag: str = "Politics",
 ) -> dict:
     return {
         "id": mid,
@@ -56,26 +55,55 @@ def _fake_market(
         "endDate": end,
         "active": True,
         "closed": False,
-        "volume": vol,
+        "volumeNum": vol,
         "openInterest": oi,
-        "liquidity": 12345.6,
-        "tags": [{"label": tag, "slug": tag.lower()}],
+        "liquidityNum": 12345.6,
         "clobTokenIds": json.dumps([f"tok-{mid}-yes", f"tok-{mid}-no"]),
     }
 
 
+def _fake_event(
+    *,
+    eid: str,
+    markets: list[dict],
+    tag: str = "Politics",
+    slug: str | None = None,
+) -> dict:
+    return {
+        "id": eid,
+        "title": f"Event {eid}",
+        "slug": slug or f"event-{eid}",
+        "tags": [{"label": tag, "slug": tag.lower()}],
+        "markets": markets,
+    }
+
+
 def test_fetch_political_markets_filters_and_schema():
-    page1 = [_fake_market(mid="A", vol=600_000, oi=75_000)] * 2
-    page2 = [_fake_market(mid="B", vol=100_000, oi=10_000)]
-    responses = iter([page1, page2, []])
+    event1 = _fake_event(
+        eid="E1",
+        markets=[
+            _fake_market(mid="A", vol=600_000, oi=75_000),
+            _fake_market(mid="B", vol=100_000, oi=10_000),
+        ],
+    )
+    event2 = _fake_event(
+        eid="E2", markets=[_fake_market(mid="C", vol=700_000, oi=0)]
+    )
+    # With page_size=500 and 1 event per batch, each iterator exits after the
+    # first short page, so we only need one response per closed flag.
+    responses = iter([[event1], [event2]])
+    seen_closed: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/markets"
+        assert request.url.path == "/events"
         assert request.url.params.get("tag_slug") == "politics"
+        assert "end_date_min" in request.url.params
+        assert "start_date_max" in request.url.params
+        seen_closed.append(request.url.params.get("closed", ""))
         return httpx.Response(200, json=next(responses))
 
     transport = httpx.MockTransport(handler)
-    cfg = IngestConfig(page_size=2)
+    cfg = IngestConfig(page_size=500)
     with httpx.Client(
         transport=transport, base_url=cfg.gamma_base_url
     ) as client:
@@ -83,9 +111,43 @@ def test_fetch_political_markets_filters_and_schema():
             "2025-10-08", "2026-04-08", config=cfg, client=client
         )
 
+    # 3 markets flattened out of 2 events
     assert len(df) == 3
+    assert set(df["market_id"]) == {"A", "B", "C"}
+    # Tags inherited from the event's tag list
+    assert all("Politics" in tags for tags in df["tags"])
+    # Both closed=true and closed=false were queried
+    assert "true" in seen_closed and "false" in seen_closed
     table = pa.Table.from_pandas(df, schema=MARKETS_SCHEMA, preserve_index=False)
     assert table.schema.equals(MARKETS_SCHEMA)
+
+
+def test_fetch_political_markets_client_side_tag_filter():
+    """Markets whose inherited tags omit 'politics' must be dropped client-side."""
+    political_event = _fake_event(
+        eid="POL",
+        markets=[_fake_market(mid="keep", vol=1_000_000, oi=0)],
+        tag="Politics",
+    )
+    sports_event = _fake_event(
+        eid="SPO",
+        markets=[_fake_market(mid="drop", vol=1_000_000, oi=0)],
+        tag="Sports",
+    )
+    responses = iter([[political_event, sports_event], []])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=next(responses))
+
+    cfg = IngestConfig(page_size=500)
+    with httpx.Client(
+        transport=httpx.MockTransport(handler), base_url=cfg.gamma_base_url
+    ) as client:
+        df = fetch_political_markets(
+            "2025-10-08", "2026-04-08", config=cfg, client=client
+        )
+
+    assert list(df["market_id"]) == ["keep"]
 
 
 def test_apply_liquidity_floor_drops_below_thresholds():
