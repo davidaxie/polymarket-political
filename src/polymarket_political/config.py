@@ -82,6 +82,12 @@ class IngestConfig(BaseSettings):
     max_retries: int = 3
     page_size: int = 500  # /gamma/markets limit per page
 
+    # Trades chunking — Polymarket caps /trades offset paging at 3000, so we
+    # slice the requested window into fixed time chunks and paginate each.
+    # On cap-hit within a chunk we halve that chunk only (bounded recovery).
+    trades_chunk_seconds: int = 1800  # 30 min baseline
+    trades_min_chunk_seconds: int = 30  # don't subdivide below this
+
     # GDELT caps at 250 records per DOC-API call
     gdelt_max_records: int = 250
 

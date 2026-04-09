@@ -134,10 +134,16 @@ def fetch_trades(
     the server returns ``{"error":"max historical activity offset of 3000
     exceeded"}`` with HTTP 400 once you page past it.
 
-    To get the full tape we recursively bisect the time window whenever a
-    window fills its offset cap, until each chunk fits under the cap. This
-    costs extra HTTP calls on busy markets but is the only correct strategy
-    Polymarket supports today.
+    Strategy 4 (hybrid chunking):
+    1. Slice ``[start, end]`` into fixed chunks of ``cfg.trades_chunk_seconds``
+       (default 30 min) — this bounds how dense any single query can get
+       without the wasteful "pull 3000 then re-pull both halves" re-fetch
+       pattern of pure bisection.
+    2. Paginate each chunk offset 0..3000. If a chunk trips the cap, halve
+       THAT chunk only and retry the halves (discarding the partial pull
+       for the tripped chunk — the pulls for other chunks are kept).
+    3. Halving is bounded by ``cfg.trades_min_chunk_seconds``; past that we
+       log and skip the sliver rather than loop forever.
     """
     cfg = config or IngestConfig()
     owns_client = client is None
@@ -148,12 +154,16 @@ def fetch_trades(
     MAX_OFFSET = 3000  # Polymarket hard cap
     rows: list[dict[str, Any]] = []
 
-    def _pull_window(lo_ts: int, hi_ts: int) -> None:
-        """Try to drain a single [lo,hi] window; bisect if we hit the cap."""
+    def _drain_chunk(lo_ts: int, hi_ts: int) -> bool:
+        """Try to drain [lo, hi] in one chunk. Return True on success.
+
+        On cap-hit returns False without mutating ``rows`` so the caller can
+        halve and retry without duplicating data.
+        """
         if hi_ts <= lo_ts:
-            return
+            return True
         offset = 0
-        window_rows: list[dict[str, Any]] = []
+        chunk_rows: list[dict[str, Any]] = []
         while True:
             params = {
                 "market": market_id,
@@ -164,38 +174,46 @@ def fetch_trades(
             }
             resp = client.get("/trades", params=params)
             if resp.status_code == 400 and "offset" in resp.text.lower():
-                # Window is too dense — split in half and retry both sides
-                mid = (lo_ts + hi_ts) // 2
-                if mid == lo_ts:
-                    # Can't subdivide further (1-second window); give up
-                    # on the rest rather than loop forever.
-                    break
-                rows.extend(window_rows)
-                _pull_window(lo_ts, mid)
-                _pull_window(mid, hi_ts)
-                return
+                return False
             resp.raise_for_status()
             payload = resp.json()
             batch = payload if isinstance(payload, list) else payload.get("data", [])
             if not batch:
                 break
-            window_rows.extend(batch)
+            chunk_rows.extend(batch)
             if len(batch) < cfg.page_size:
                 break
             offset += cfg.page_size
             if offset >= MAX_OFFSET:
-                # Next request would hit the cap — proactively bisect
-                mid = (lo_ts + hi_ts) // 2
-                if mid == lo_ts:
-                    break
-                rows.extend(window_rows)
-                _pull_window(lo_ts, mid)
-                _pull_window(mid, hi_ts)
-                return
-        rows.extend(window_rows)
+                # Next page would hit the hard cap — treat as cap-hit and
+                # halve instead of risking a silent truncation.
+                return False
+        rows.extend(chunk_rows)
+        return True
+
+    def _pull_range(lo_ts: int, hi_ts: int) -> None:
+        """Halving recovery for a single tripped chunk."""
+        if hi_ts <= lo_ts:
+            return
+        if _drain_chunk(lo_ts, hi_ts):
+            return
+        if (hi_ts - lo_ts) <= cfg.trades_min_chunk_seconds:
+            log.warning(
+                "trades: giving up on dense sliver %s [%d,%d] (<%ds)",
+                market_id, lo_ts, hi_ts, cfg.trades_min_chunk_seconds,
+            )
+            return
+        mid = (lo_ts + hi_ts) // 2
+        _pull_range(lo_ts, mid)
+        _pull_range(mid, hi_ts)
 
     try:
-        _pull_window(start_ts, end_ts)
+        step = max(1, int(cfg.trades_chunk_seconds))
+        cursor = start_ts
+        while cursor < end_ts:
+            nxt = min(cursor + step, end_ts)
+            _pull_range(cursor, nxt)
+            cursor = nxt
     finally:
         if owns_client:
             client.close()

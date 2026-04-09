@@ -262,7 +262,7 @@ def test_fetch_trades_schema_and_taker_side():
         assert request.url.params.get("market") == "0xabc"
         return httpx.Response(200, json=next(responses))
 
-    cfg = IngestConfig(page_size=2)
+    cfg = IngestConfig(page_size=2, trades_chunk_seconds=7 * 24 * 3600)
     with httpx.Client(
         transport=httpx.MockTransport(handler),
         base_url="https://data-api.polymarket.com",
@@ -279,6 +279,67 @@ def test_fetch_trades_schema_and_taker_side():
     assert df["timestamp"].dt.tz is not None
     table = pa.Table.from_pandas(df, schema=TRADES_SCHEMA, preserve_index=False)
     assert table.schema.equals(TRADES_SCHEMA)
+
+
+def test_fetch_trades_halves_on_offset_cap():
+    """When the API returns the 'max offset 3000 exceeded' error for a chunk,
+    fetch_trades should halve that chunk only and retry the halves, discarding
+    the partial pull for the tripped chunk (no duplicates, no re-fetch storms).
+    """
+    calls: list[tuple[int, int]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        lo = int(request.url.params["startTs"])
+        hi = int(request.url.params["endTs"])
+        calls.append((lo, hi))
+        # Any chunk spanning more than 60s trips the cap on the first call.
+        if (hi - lo) > 60:
+            return httpx.Response(
+                400, json={"error": "max historical activity offset of 3000 exceeded"}
+            )
+        # Small chunk: return one trade stamped at lo, then empty.
+        offset = int(request.url.params.get("offset", 0))
+        if offset == 0:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": f"t-{lo}",
+                        "market": "0xabc",
+                        "asset": "tok",
+                        "timestamp": lo,
+                        "price": 0.5,
+                        "size": 1,
+                        "side": "BUY",
+                        "outcome": "YES",
+                    }
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    # 120s window, 120s chunk → first call trips cap, halves to 60s chunks.
+    cfg = IngestConfig(
+        page_size=2, trades_chunk_seconds=120, trades_min_chunk_seconds=30
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="https://data-api.polymarket.com",
+    ) as client:
+        df = fetch_trades(
+            "0xabc",
+            "2024-01-01T00:00:00Z",
+            "2024-01-01T00:02:00Z",
+            config=cfg,
+            client=client,
+        )
+
+    # Two 60-second halves should each yield one unique trade, no duplicates.
+    assert len(df) == 2
+    assert df["trade_id"].is_unique
+    # First call was the 120s chunk that tripped; followed by two halved calls.
+    assert calls[0] == (1704067200, 1704067320)
+    assert (1704067200, 1704067260) in calls
+    assert (1704067260, 1704067320) in calls
 
 
 def test_derive_taker_side_variants():
