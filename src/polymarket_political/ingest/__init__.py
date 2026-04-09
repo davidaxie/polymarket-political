@@ -22,7 +22,13 @@ from .prices import (
     fetch_price_history,
     load_or_fetch_price_history,
 )
-from .trades import TRADES_SCHEMA, derive_taker_side, fetch_trades
+from .trades import (
+    TRADES_SCHEMA,
+    cache_trades_parquet,
+    derive_taker_side,
+    fetch_trades,
+    load_or_fetch_trades,
+)
 
 __all__ = [
     "MARKETS_SCHEMA",
@@ -32,6 +38,7 @@ __all__ = [
     "TRADES_SCHEMA",
     "apply_liquidity_floor",
     "cache_price_history_parquet",
+    "cache_trades_parquet",
     "derive_taker_side",
     "fetch_gdelt_headlines",
     "fetch_orderbook_snapshots",
@@ -40,4 +47,5 @@ __all__ = [
     "fetch_trades",
     "list_political_markets",
     "load_or_fetch_price_history",
+    "load_or_fetch_trades",
 ]

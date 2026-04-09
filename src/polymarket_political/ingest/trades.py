@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable
 
 import httpx
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from ..config import IngestConfig
 
@@ -207,4 +209,75 @@ def fetch_trades(
         )
         # Bisection may have produced overlapping calls; dedupe by trade_id.
         df = df.drop_duplicates(subset=["trade_id"]).reset_index(drop=True)
+    return df
+
+
+def _safe_stamp(value: datetime | str) -> str:
+    """Compact UTC stamp for building cache filenames (e.g. 20241104T120000Z)."""
+    return _as_utc_ts(value).strftime("%Y%m%dT%H%M%SZ")
+
+
+def cache_trades_parquet(
+    df: pd.DataFrame,
+    market_id: str,
+    start: datetime | str,
+    end: datetime | str,
+    *,
+    config: IngestConfig | None = None,
+) -> Path:
+    """Write a trades frame to ``data/raw/trades_{market}_{start}_{end}.parquet``.
+
+    Cache key is keyed on ``(market_id, start, end)`` — same window, same cache.
+    """
+    cfg = config or IngestConfig()
+    out_dir = Path(cfg.data_root) / cfg.raw_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / (
+        f"trades_{market_id}_{_safe_stamp(start)}_{_safe_stamp(end)}.parquet"
+    )
+    table = pa.Table.from_pandas(df, schema=TRADES_SCHEMA, preserve_index=False)
+    pq.write_table(table, path)
+    return path
+
+
+def load_or_fetch_trades(
+    market_id: str,
+    start: datetime | str,
+    end: datetime | str,
+    *,
+    config: IngestConfig | None = None,
+    client: httpx.Client | None = None,
+    base_url: str = "https://data-api.polymarket.com",
+) -> pd.DataFrame:
+    """Return a cached parquet if present, else fetch via bisection and cache.
+
+    This is the preferred entry point for downstream pipeline code because
+    ``fetch_trades`` can be very expensive on high-volume markets (hundreds of
+    HTTP requests via the bisection fallback once Polymarket's 3000-offset cap
+    kicks in). The cache turns repeated pipeline runs over the same window
+    into a single parquet read.
+
+    NOTE: Cache is keyed only on ``(market_id, start, end)``. For *resolved*
+    markets the trade tape is immutable, so this is always safe. For *live*
+    markets where ``end`` is close to "now", new trades may have landed since
+    the cache was written — delete the parquet to force a refresh. See
+    IngestConfig for a future TTL knob if this becomes painful.
+    """
+    cfg = config or IngestConfig()
+    out_dir = Path(cfg.data_root) / cfg.raw_subdir
+    path = out_dir / (
+        f"trades_{market_id}_{_safe_stamp(start)}_{_safe_stamp(end)}.parquet"
+    )
+    if path.exists():
+        table = pq.read_table(path)
+        df = table.to_pandas()
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        return df
+    df = fetch_trades(
+        market_id, start, end, config=cfg, client=client, base_url=base_url
+    )
+    try:
+        cache_trades_parquet(df, market_id, start, end, config=cfg)
+    except Exception as exc:  # pragma: no cover — best-effort cache
+        log.warning("Failed to cache trades parquet for %s: %s", market_id, exc)
     return df

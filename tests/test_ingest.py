@@ -33,6 +33,10 @@ from polymarket_political.ingest.prices import (
     cache_price_history_parquet,
     load_or_fetch_price_history,
 )
+from polymarket_political.ingest.trades import (
+    cache_trades_parquet,
+    load_or_fetch_trades,
+)
 
 
 # -------------------------- markets -----------------------------------------
@@ -453,3 +457,92 @@ def test_cache_price_history_parquet_roundtrip(tmp_path):
 
     table = pq.read_table(path)
     assert table.schema.equals(PRICES_SCHEMA)
+
+
+def test_load_or_fetch_trades_uses_cache(tmp_path):
+    """Second call to load_or_fetch_trades for the same window is a cache hit.
+
+    This is the key property that makes Week 3 backtests affordable: once the
+    bisecting pagination has drained a window and written parquet, re-running
+    the pipeline is O(file_read) instead of O(dozens of HTTP calls).
+    """
+    call_count = {"n": 0}
+    trades_page = [
+        {
+            "id": "t1",
+            "market": "0xabc",
+            "asset": "tok-1",
+            "timestamp": 1700000100,
+            "price": 0.42,
+            "size": 500,
+            "side": "BUY",
+            "outcome": "YES",
+        }
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        # First response: 1 trade. Subsequent pages: empty to stop pagination.
+        if call_count["n"] == 1:
+            return httpx.Response(200, json=trades_page)
+        return httpx.Response(200, json=[])
+
+    cfg = IngestConfig(data_root=str(tmp_path), page_size=2)
+    with httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="https://data-api.polymarket.com",
+    ) as client:
+        df1 = load_or_fetch_trades(
+            "0xabc",
+            "2023-11-14T00:00:00Z",
+            "2023-11-16T00:00:00Z",
+            config=cfg,
+            client=client,
+        )
+    first_n = call_count["n"]
+    assert first_n >= 1
+    assert len(df1) == 1
+
+    # Second call with a fresh client — cache should serve without HTTP
+    with httpx.Client(
+        transport=httpx.MockTransport(handler),
+        base_url="https://data-api.polymarket.com",
+    ) as client:
+        df2 = load_or_fetch_trades(
+            "0xabc",
+            "2023-11-14T00:00:00Z",
+            "2023-11-16T00:00:00Z",
+            config=cfg,
+            client=client,
+        )
+    assert call_count["n"] == first_n  # no new HTTP calls
+    assert len(df2) == 1
+    # Cached frame preserves tz-aware UTC timestamps
+    assert df2["timestamp"].dt.tz is not None
+
+
+def test_cache_trades_parquet_roundtrip(tmp_path):
+    """Round-tripping a trades frame through parquet preserves TRADES_SCHEMA."""
+    df = pd.DataFrame(
+        {
+            "trade_id": ["t1", "t2"],
+            "market_id": ["0xabc", "0xabc"],
+            "token_id": ["tok-1", "tok-1"],
+            "timestamp": pd.to_datetime(
+                ["2023-11-14T00:00:00Z", "2023-11-14T01:00:00Z"], utc=True
+            ),
+            "price": [0.41, 0.42],
+            "size": [100.0, 250.0],
+            "taker_side": ["buy", "sell"],
+            "outcome": ["YES", "YES"],
+        }
+    )
+    cfg = IngestConfig(data_root=str(tmp_path))
+    path = cache_trades_parquet(
+        df, "0xabc", "2023-11-14T00:00:00Z", "2023-11-14T02:00:00Z", config=cfg
+    )
+    assert path.exists()
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path)
+    assert table.schema.equals(TRADES_SCHEMA)

@@ -41,9 +41,9 @@ from .backtest.ledger import Trade, simulate_trade_provisional
 from .config import BacktestConfig, IngestConfig, SignalConfig
 from .ingest import (
     apply_liquidity_floor,
-    fetch_trades,
     list_political_markets,
     load_or_fetch_price_history,
+    load_or_fetch_trades,
 )
 from .report.metrics import MetricsSummary, compute_metrics
 from .signal.detector import Event, detect_events, events_to_frame
@@ -369,7 +369,7 @@ def run_backtest(
         lambda s, e, **kw: list_political_markets(s, e, config=ing_cfg, **kw)
     )
     fetch_trades_fn = trades_fetcher or (
-        lambda mid, s, e, **kw: fetch_trades(mid, s, e, config=ing_cfg, **kw)
+        lambda mid, s, e, **kw: load_or_fetch_trades(mid, s, e, config=ing_cfg, **kw)
     )
     fetch_prices_fn = prices_fetcher or (
         lambda tok, s, e, **kw: load_or_fetch_price_history(
