@@ -134,16 +134,16 @@ def fetch_trades(
     the server returns ``{"error":"max historical activity offset of 3000
     exceeded"}`` with HTTP 400 once you page past it.
 
-    Strategy 4 (hybrid chunking):
+    Strategy: fixed-width chunking with cap-tolerant pagination.
     1. Slice ``[start, end]`` into fixed chunks of ``cfg.trades_chunk_seconds``
-       (default 30 min) — this bounds how dense any single query can get
-       without the wasteful "pull 3000 then re-pull both halves" re-fetch
-       pattern of pure bisection.
-    2. Paginate each chunk offset 0..3000. If a chunk trips the cap, halve
-       THAT chunk only and retry the halves (discarding the partial pull
-       for the tripped chunk — the pulls for other chunks are kept).
-    3. Halving is bounded by ``cfg.trades_min_chunk_seconds``; past that we
-       log and skip the sliver rather than loop forever.
+       (default 30 min).
+    2. Paginate each chunk offset 0..3000. If a chunk hits the offset cap,
+       **keep the ~3000 trades we got** (a statistically robust sample for
+       taker-imbalance and volume-spike detection) and move on to the next
+       chunk. No halving — halving creates O(thousands) of redundant HTTP
+       calls on ultra-dense markets like Trump 2024 election night.
+    3. The ``truncated`` flag on the returned DataFrame (attr) indicates
+       whether any chunk was capped.
     """
     cfg = config or IngestConfig()
     owns_client = client is None
@@ -153,15 +153,13 @@ def fetch_trades(
 
     MAX_OFFSET = 3000  # Polymarket hard cap
     rows: list[dict[str, Any]] = []
+    any_truncated = False
 
-    def _drain_chunk(lo_ts: int, hi_ts: int) -> bool:
-        """Try to drain [lo, hi] in one chunk. Return True on success.
-
-        On cap-hit returns False without mutating ``rows`` so the caller can
-        halve and retry without duplicating data.
-        """
+    def _drain_chunk(lo_ts: int, hi_ts: int) -> None:
+        """Paginate [lo, hi] keeping up to 3000 trades on cap-hit."""
+        nonlocal any_truncated
         if hi_ts <= lo_ts:
-            return True
+            return
         offset = 0
         chunk_rows: list[dict[str, Any]] = []
         while True:
@@ -172,9 +170,22 @@ def fetch_trades(
                 "limit": cfg.page_size,
                 "offset": offset,
             }
-            resp = client.get("/trades", params=params)
+            try:
+                resp = client.get("/trades", params=params)
+            except httpx.ReadTimeout:
+                log.warning(
+                    "trades: timeout on %s [%d,%d] offset=%d, keeping %d rows",
+                    market_id, lo_ts, hi_ts, offset, len(chunk_rows),
+                )
+                any_truncated = True
+                break
             if resp.status_code == 400 and "offset" in resp.text.lower():
-                return False
+                log.info(
+                    "trades: offset cap on %s [%d,%d], keeping %d rows",
+                    market_id, lo_ts, hi_ts, len(chunk_rows),
+                )
+                any_truncated = True
+                break
             resp.raise_for_status()
             payload = resp.json()
             batch = payload if isinstance(payload, list) else payload.get("data", [])
@@ -185,34 +196,20 @@ def fetch_trades(
                 break
             offset += cfg.page_size
             if offset >= MAX_OFFSET:
-                # Next page would hit the hard cap — treat as cap-hit and
-                # halve instead of risking a silent truncation.
-                return False
+                log.info(
+                    "trades: proactive cap on %s [%d,%d], keeping %d rows",
+                    market_id, lo_ts, hi_ts, len(chunk_rows),
+                )
+                any_truncated = True
+                break
         rows.extend(chunk_rows)
-        return True
-
-    def _pull_range(lo_ts: int, hi_ts: int) -> None:
-        """Halving recovery for a single tripped chunk."""
-        if hi_ts <= lo_ts:
-            return
-        if _drain_chunk(lo_ts, hi_ts):
-            return
-        if (hi_ts - lo_ts) <= cfg.trades_min_chunk_seconds:
-            log.warning(
-                "trades: giving up on dense sliver %s [%d,%d] (<%ds)",
-                market_id, lo_ts, hi_ts, cfg.trades_min_chunk_seconds,
-            )
-            return
-        mid = (lo_ts + hi_ts) // 2
-        _pull_range(lo_ts, mid)
-        _pull_range(mid, hi_ts)
 
     try:
         step = max(1, int(cfg.trades_chunk_seconds))
         cursor = start_ts
         while cursor < end_ts:
             nxt = min(cursor + step, end_ts)
-            _pull_range(cursor, nxt)
+            _drain_chunk(cursor, nxt)
             cursor = nxt
     finally:
         if owns_client:
@@ -225,8 +222,8 @@ def fetch_trades(
         df = df[(df["timestamp"] >= lo) & (df["timestamp"] <= hi)].reset_index(
             drop=True
         )
-        # Bisection may have produced overlapping calls; dedupe by trade_id.
         df = df.drop_duplicates(subset=["trade_id"]).reset_index(drop=True)
+    df.attrs["truncated"] = any_truncated
     return df
 
 
