@@ -51,6 +51,7 @@ from .signal.features import (
     compute_1h_price_move,
     compute_taker_imbalance,
     rolling_hourly_volume,
+    rolling_hourly_volatility,
 )
 
 log = logging.getLogger(__name__)
@@ -150,61 +151,37 @@ def build_features(
     prices: pd.DataFrame,
     signal_config: SignalConfig,
 ) -> pd.DataFrame:
-    """Join the three per-(market, hour) feature frames for the detector.
+    """Join per-(market, hour) feature frames for the detector.
 
-    ``trades`` must have ``[timestamp, market_id, size, taker_side]`` (as
-    produced by :func:`ingest.trades.fetch_trades`). ``prices`` must have
-    ``[timestamp, market_id, mid_price]`` (from
-    :func:`ingest.prices.fetch_price_history`).
+    Supports two modes controlled by ``signal_config.signal_mode``:
+
+    **prices_only** (default): derives ``volatility_ratio`` from minute-level
+    prices plus ``abs_price_move``. Trades are ignored.
+
+    **trades**: derives ``volume_ratio`` + ``taker_imbalance`` from the trade
+    tape, plus ``abs_price_move`` from prices. Requires trade data.
     """
-    contract_columns = [
-        "market_id",
-        "timestamp",
-        "volume_1h",
-        "volume_7d_mean",
-        "volume_multiplier",
-        "price_move_1h",
-        "taker_imbalance_1h",
-        "news_window",
-        # Legacy column names retained as aliases so the detector and the
-        # rest of the pipeline keep working.
-        "volume_ratio",
-        "abs_price_move",
-        "imbalance",
-    ]
-    if trades.empty and prices.empty:
-        empty = pd.DataFrame(columns=contract_columns)
+    prices_only = signal_config.signal_mode == "prices_only"
+
+    # --- empty-input fast path ---
+    if prices.empty and (prices_only or trades.empty):
+        cols = (
+            ["market_id", "timestamp", "volatility_ratio", "abs_price_move",
+             "news_window"]
+            if prices_only
+            else ["market_id", "timestamp", "volume_ratio", "abs_price_move",
+                  "imbalance", "news_window"]
+        )
+        empty = pd.DataFrame(columns=cols)
         empty["timestamp"] = pd.to_datetime(empty["timestamp"], utc=True)
         empty["news_window"] = empty["news_window"].astype(bool)
-        for col in (
-            "volume_1h",
-            "volume_7d_mean",
-            "volume_multiplier",
-            "price_move_1h",
-            "taker_imbalance_1h",
-            "volume_ratio",
-            "abs_price_move",
-            "imbalance",
-        ):
-            empty[col] = empty[col].astype("float64")
+        for c in cols:
+            if c not in ("market_id", "timestamp", "news_window"):
+                empty[c] = empty[c].astype("float64")
         return empty
 
-    vol = rolling_hourly_volume(trades, window=signal_config.volume_lookback)
-
-    # compute_taker_imbalance expects a `side` column; trades have `taker_side`.
-    if not trades.empty:
-        imb_input = trades.rename(columns={"taker_side": "side"})
-    else:
-        imb_input = trades
-    imb = compute_taker_imbalance(
-        imb_input, window=signal_config.taker_imbalance_window
-    )
-
+    # --- price move (both modes) ---
     mv = compute_1h_price_move(prices)
-
-    # Align all three to the hourly grid keyed on (market_id, timestamp).
-    # Floor timestamps so the price series (which can be minutely) joins
-    # correctly against the hourly volume/imbalance frames.
     if not mv.empty:
         mv = mv.copy()
         mv["timestamp"] = pd.to_datetime(mv["timestamp"], utc=True).dt.floor("1h")
@@ -216,29 +193,47 @@ def build_features(
             )
         )
 
-    joined = vol.merge(mv, on=["market_id", "timestamp"], how="outer")
-    joined = joined.merge(imb, on=["market_id", "timestamp"], how="outer")
+    if prices_only:
+        # --- volatility from minute-level prices ---
+        volat = rolling_hourly_volatility(
+            prices, window=signal_config.volume_lookback
+        )
+        if volat.empty:
+            joined = mv.copy() if not mv.empty else pd.DataFrame()
+        else:
+            joined = volat.merge(mv, on=["market_id", "timestamp"], how="outer")
 
-    # Fill columns the detector requires but that may be missing on sparse rows.
-    for col in ("volume_ratio", "abs_price_move", "imbalance"):
-        if col not in joined.columns:
-            joined[col] = float("nan")
-    if "hourly_volume" not in joined.columns:
-        joined["hourly_volume"] = float("nan")
-    if "baseline_volume" not in joined.columns:
-        joined["baseline_volume"] = float("nan")
+        for col in ("volatility_ratio", "abs_price_move"):
+            if col not in joined.columns:
+                joined[col] = float("nan")
+        joined["timestamp"] = pd.to_datetime(joined["timestamp"], utc=True)
+        joined["volatility_ratio"] = joined["volatility_ratio"].astype("float64")
+        joined["abs_price_move"] = joined["abs_price_move"].astype("float64")
+    else:
+        # --- trades mode: volume + imbalance ---
+        vol = rolling_hourly_volume(trades, window=signal_config.volume_lookback)
+        if not trades.empty:
+            imb_input = trades.rename(columns={"taker_side": "side"})
+        else:
+            imb_input = trades
+        imb = compute_taker_imbalance(
+            imb_input, window=signal_config.taker_imbalance_window
+        )
+        joined = vol.merge(mv, on=["market_id", "timestamp"], how="outer")
+        joined = joined.merge(imb, on=["market_id", "timestamp"], how="outer")
 
-    # Enforce the public feature contract: tz-aware UTC timestamps,
-    # float64 numerics, plus the canonical column aliases.
-    joined["timestamp"] = pd.to_datetime(joined["timestamp"], utc=True)
-    joined["volume_1h"] = joined["hourly_volume"].astype("float64")
-    joined["volume_7d_mean"] = joined["baseline_volume"].astype("float64")
-    joined["volume_multiplier"] = joined["volume_ratio"].astype("float64")
-    joined["price_move_1h"] = joined["abs_price_move"].astype("float64")
-    joined["taker_imbalance_1h"] = joined["imbalance"].astype("float64")
-    joined["volume_ratio"] = joined["volume_ratio"].astype("float64")
-    joined["abs_price_move"] = joined["abs_price_move"].astype("float64")
-    joined["imbalance"] = joined["imbalance"].astype("float64")
+        for col in ("volume_ratio", "abs_price_move", "imbalance"):
+            if col not in joined.columns:
+                joined[col] = float("nan")
+        if "hourly_volume" not in joined.columns:
+            joined["hourly_volume"] = float("nan")
+        if "baseline_volume" not in joined.columns:
+            joined["baseline_volume"] = float("nan")
+
+        joined["timestamp"] = pd.to_datetime(joined["timestamp"], utc=True)
+        joined["volume_ratio"] = joined["volume_ratio"].astype("float64")
+        joined["abs_price_move"] = joined["abs_price_move"].astype("float64")
+        joined["imbalance"] = joined["imbalance"].astype("float64")
 
     # ``news_window`` defaults to False so the detector never crashes when no
     # news data is provided. Callers (e.g. tests) may overwrite the column.
@@ -371,9 +366,11 @@ def run_backtest(
     fetch_trades_fn = trades_fetcher or (
         lambda mid, s, e, **kw: load_or_fetch_trades(mid, s, e, config=ing_cfg, **kw)
     )
+    # In prices_only mode, fetch 1-minute fidelity for volatility calculation.
+    _prices_interval = "1m" if sig_cfg.signal_mode == "prices_only" else "1h"
     fetch_prices_fn = prices_fetcher or (
         lambda tok, s, e, **kw: load_or_fetch_price_history(
-            tok, s, e, config=ing_cfg, **kw
+            tok, s, e, interval=_prices_interval, config=ing_cfg, **kw
         )
     )
 
@@ -403,11 +400,15 @@ def run_backtest(
         # YES-token is conventionally the first token id.
         yes_token = token_ids[0] if token_ids else market_id
 
-        try:
-            trades = fetch_trades_fn(condition_id, resolved_start, resolved_end, client=client)
-        except Exception as exc:  # pragma: no cover — network-path guard
-            warnings.append(f"trades fetch failed for {market_id}: {exc}")
-            continue
+        # In prices_only mode, skip the expensive trades fetch entirely.
+        if sig_cfg.signal_mode == "prices_only":
+            trades = pd.DataFrame()
+        else:
+            try:
+                trades = fetch_trades_fn(condition_id, resolved_start, resolved_end, client=client)
+            except Exception as exc:  # pragma: no cover — network-path guard
+                warnings.append(f"trades fetch failed for {market_id}: {exc}")
+                continue
         try:
             prices = fetch_prices_fn(yes_token, resolved_start, resolved_end, client=client)
         except Exception as exc:  # pragma: no cover — network-path guard
@@ -437,15 +438,12 @@ def run_backtest(
     if all_features:
         features_df = pd.concat(all_features, ignore_index=True)
     else:
-        features_df = pd.DataFrame(
-            columns=[
-                "market_id",
-                "timestamp",
-                "volume_ratio",
-                "abs_price_move",
-                "imbalance",
-            ]
+        _fallback_cols = (
+            ["market_id", "timestamp", "volatility_ratio", "abs_price_move"]
+            if sig_cfg.signal_mode == "prices_only"
+            else ["market_id", "timestamp", "volume_ratio", "abs_price_move", "imbalance"]
         )
+        features_df = pd.DataFrame(columns=_fallback_cols)
     events = detect_events(features_df, sig_cfg)
     log.info("detected %d events", len(events))
 

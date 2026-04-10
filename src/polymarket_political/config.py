@@ -25,6 +25,13 @@ class SignalConfig(BaseSettings):
     volume_multiplier: float = 3.0
     price_move_threshold: float = 0.05
     taker_imbalance_threshold: float = 0.6
+    volatility_multiplier: float = 3.0  # for prices-only mode
+
+    # Signal mode: "prices_only" (default) uses volatility_ratio + price_move.
+    # "trades" mode uses volume_ratio + price_move + taker_imbalance (requires
+    # trade tape). Prices-only mode is the default because the Polymarket
+    # Data API caps trade history at 3000 records.
+    signal_mode: str = "prices_only"
 
     # Filters
     news_filter_enabled: bool = True

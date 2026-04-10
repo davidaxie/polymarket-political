@@ -130,6 +130,7 @@ def _canned_prices(token_id: str) -> pd.DataFrame:
 def test_run_backtest_end_to_end_returns_metrics_summary(tmp_path):
     ingest_cfg = IngestConfig(data_root=str(tmp_path))
     signal_cfg = SignalConfig(
+        signal_mode="trades",
         volume_lookback="7d",
         volume_multiplier=3.0,
         price_move_threshold=0.05,
@@ -212,6 +213,7 @@ def test_news_filter_applied_to_controls_symmetrically(tmp_path, monkeypatch):
 
     ingest_cfg = IngestConfig(data_root=str(tmp_path))
     signal_cfg = SignalConfig(
+        signal_mode="trades",
         volume_lookback="7d",
         volume_multiplier=3.0,
         price_move_threshold=0.05,
@@ -267,6 +269,7 @@ def test_news_filter_disabled_yields_identical_control_metrics(tmp_path):
     """When news_filter_enabled=False the two control metrics must match."""
     ingest_cfg = IngestConfig(data_root=str(tmp_path))
     signal_cfg = SignalConfig(
+        signal_mode="trades",
         volume_lookback="7d",
         volume_multiplier=3.0,
         price_move_threshold=0.05,
@@ -297,21 +300,19 @@ def test_news_filter_disabled_yields_identical_control_metrics(tmp_path):
 
 
 def test_build_features_handles_empty_inputs():
+    # prices_only mode (default)
     sig_cfg = SignalConfig()
     out = build_features(pd.DataFrame(), pd.DataFrame(), sig_cfg)
-    # Contract columns must always be present, even on the empty path.
-    for col in (
-        "market_id",
-        "timestamp",
-        "volume_1h",
-        "volume_7d_mean",
-        "volume_multiplier",
-        "price_move_1h",
-        "taker_imbalance_1h",
-        "news_window",
-    ):
+    for col in ("market_id", "timestamp", "volatility_ratio", "abs_price_move", "news_window"):
         assert col in out.columns
     assert out.empty
+
+    # trades mode
+    sig_cfg_t = SignalConfig(signal_mode="trades")
+    out_t = build_features(pd.DataFrame(), pd.DataFrame(), sig_cfg_t)
+    for col in ("market_id", "timestamp", "volume_ratio", "abs_price_move", "imbalance", "news_window"):
+        assert col in out_t.columns
+    assert out_t.empty
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +364,7 @@ def test_full_pipeline_on_synthetic_market(tmp_path):
 
     ingest_cfg = IngestConfig(data_root=str(tmp_path))
     signal_cfg = SignalConfig(
+        signal_mode="trades",
         volume_lookback="7d",
         volume_multiplier=3.0,
         price_move_threshold=0.05,
@@ -446,7 +448,7 @@ def test_pipeline_market_with_zero_trades(tmp_path):
 
 
 def test_build_features_schema():
-    """``build_features`` must satisfy the public column contract."""
+    """``build_features`` must satisfy the public column contract in both modes."""
     start = datetime(2025, 11, 1, tzinfo=timezone.utc)
     end = datetime(2025, 11, 12, tzinfo=timezone.utc)
     trades, prices = make_synthetic_market(
@@ -458,40 +460,30 @@ def test_build_features_schema():
         n_trades=3000,
     )
 
-    sig_cfg = SignalConfig()
-    out = build_features(trades, prices, sig_cfg)
+    # --- prices_only mode ---
+    sig_cfg_p = SignalConfig(signal_mode="prices_only")
+    out_p = build_features(trades, prices, sig_cfg_p)
+    for col in ("market_id", "timestamp", "volatility_ratio", "abs_price_move", "news_window"):
+        assert col in out_p.columns
+    assert not out_p.empty
+    assert out_p["volatility_ratio"].dtype == "float64"
+    assert out_p["abs_price_move"].dtype == "float64"
+    assert out_p["news_window"].dtype == bool
 
-    expected_columns = {
-        "market_id",
-        "timestamp",
-        "volume_1h",
-        "volume_7d_mean",
-        "volume_multiplier",
-        "price_move_1h",
-        "taker_imbalance_1h",
-        "news_window",
-    }
-    assert expected_columns.issubset(set(out.columns))
-    assert not out.empty
+    # --- trades mode ---
+    sig_cfg_t = SignalConfig(signal_mode="trades")
+    out_t = build_features(trades, prices, sig_cfg_t)
+    for col in ("market_id", "timestamp", "volume_ratio", "abs_price_move", "imbalance", "news_window"):
+        assert col in out_t.columns
+    assert not out_t.empty
 
-    # timestamp is tz-aware UTC.
-    ts_dtype = out["timestamp"].dtype
-    assert getattr(ts_dtype, "tz", None) is not None
-    assert str(ts_dtype.tz) == "UTC"
-
-    # all numeric contract columns are float64.
-    for col in (
-        "volume_1h",
-        "volume_7d_mean",
-        "volume_multiplier",
-        "price_move_1h",
-        "taker_imbalance_1h",
-    ):
-        assert out[col].dtype == "float64", (col, out[col].dtype)
-
-    # news_window defaults to bool False when no news data is provided.
-    assert out["news_window"].dtype == bool
-    assert not out["news_window"].any()
+    # timestamp is tz-aware UTC in both modes.
+    for out in (out_p, out_t):
+        ts_dtype = out["timestamp"].dtype
+        assert getattr(ts_dtype, "tz", None) is not None
+        assert str(ts_dtype.tz) == "UTC"
+        assert out["news_window"].dtype == bool
+        assert not out["news_window"].any()
 
 
 def test_simulate_trade_provisional_boundary_prices():

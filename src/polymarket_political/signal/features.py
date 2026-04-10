@@ -176,3 +176,81 @@ def compute_taker_imbalance(
     )
     agg["imbalance"] = agg["imbalance"].astype(float).fillna(0.0)
     return agg
+
+
+def rolling_hourly_volatility(
+    prices: pd.DataFrame, window: str = "7d"
+) -> pd.DataFrame:
+    """Compute per-market hourly realized volatility and its rolling baseline.
+
+    This is the prices-only replacement for both ``rolling_hourly_volume``
+    (derived from trades) and ``compute_taker_imbalance``. Elevated realized
+    volatility is a well-established proxy for informed trading activity —
+    large directional flows create price impact that shows up as higher
+    return variance.
+
+    Parameters
+    ----------
+    prices:
+        Columns: ``timestamp`` (datetime64[ns, UTC]), ``market_id``,
+        ``mid_price`` (float, 0-1 probability units). Should be at
+        fine fidelity (1-minute) for good intra-hour statistics.
+    window:
+        Rolling baseline length for the volatility ratio.
+
+    Returns
+    -------
+    DataFrame with columns: ``timestamp``, ``market_id``,
+    ``hourly_volatility`` (std of log returns within the hour),
+    ``baseline_volatility`` (rolling mean of hourly vol),
+    ``volatility_ratio`` (hourly / baseline; ``inf`` if baseline==0).
+    """
+    empty_cols = [
+        "timestamp", "market_id", "hourly_volatility",
+        "baseline_volatility", "volatility_ratio",
+    ]
+    if prices.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    df = _ensure_sorted(prices.copy())
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+
+    # Log returns per market — handles 0-prices gracefully.
+    pieces: list[pd.DataFrame] = []
+    for mkt, grp in df.groupby("market_id"):
+        grp = grp.sort_values("timestamp").copy()
+        grp["log_ret"] = grp["mid_price"].apply(
+            lambda p: float("nan") if p <= 0 else p
+        ).pipe(lambda s: s.pct_change().abs())  # absolute return magnitude
+        pieces.append(grp)
+
+    if not pieces:
+        return pd.DataFrame(columns=empty_cols)
+    df = pd.concat(pieces, ignore_index=True)
+
+    # Hourly realized volatility = std of returns within each hour.
+    hourly = (
+        df.set_index("timestamp")
+        .groupby("market_id")["log_ret"]
+        .resample("1h")
+        .std()
+        .rename("hourly_volatility")
+        .reset_index()
+    )
+    hourly["hourly_volatility"] = hourly["hourly_volatility"].fillna(0.0)
+
+    # Rolling baseline of the hourly volatility.
+    baselines: list[pd.DataFrame] = []
+    for mkt, grp in hourly.groupby("market_id"):
+        grp = grp.sort_values("timestamp").copy()
+        grp["baseline_volatility"] = (
+            grp.set_index("timestamp")["hourly_volatility"]
+            .rolling(window, closed="left")
+            .mean()
+            .values
+        )
+        baselines.append(grp)
+
+    out = pd.concat(baselines, ignore_index=True)
+    out["volatility_ratio"] = out["hourly_volatility"] / out["baseline_volatility"]
+    return out

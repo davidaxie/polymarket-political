@@ -36,6 +36,7 @@ def _row(market_id, ts, volume_ratio, abs_price_move, imbalance, news=False):
 @pytest.fixture
 def config() -> SignalConfig:
     return SignalConfig(
+        signal_mode="trades",
         volume_multiplier=3.0,
         price_move_threshold=0.05,
         taker_imbalance_threshold=0.6,
@@ -167,9 +168,9 @@ def test_threshold_sweep_via_config():
         ]
     )
     # Default 3.0 multiplier blocks it.
-    assert detect_events(df, SignalConfig()) == []
+    assert detect_events(df, SignalConfig(signal_mode="trades")) == []
     # Loosen via config injection — one-line sweep.
-    loose = SignalConfig(volume_multiplier=1.5)
+    loose = SignalConfig(signal_mode="trades", volume_multiplier=1.5)
     assert len(detect_events(df, loose)) == 1
 
 
@@ -220,7 +221,7 @@ def _feature_rows(draw):
 @settings(max_examples=50, deadline=None)
 @given(df=_feature_rows())
 def test_detector_is_deterministic(df):
-    cfg = SignalConfig()
+    cfg = SignalConfig(signal_mode="trades")
     a = detect_events(df.copy(), cfg)
     b = detect_events(df.copy(), cfg)
     assert a == b
@@ -252,6 +253,7 @@ def test_detect_events_cold_start():
     )
 
     sig_cfg = SignalConfig(
+        signal_mode="trades",
         volume_lookback="7d",
         volume_multiplier=3.0,
         price_move_threshold=0.05,
