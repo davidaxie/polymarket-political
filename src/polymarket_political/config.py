@@ -33,6 +33,15 @@ class SignalConfig(BaseSettings):
     # Data API caps trade history at 3000 records.
     signal_mode: str = "prices_only"
 
+    # Entry timing: delay (hours) between signal detection and trade entry.
+    # 0 = enter at spike hour (immediate). Positive values = lagged entry.
+    # Use with entry_direction to control buy vs contrarian.
+    entry_delay_hours: int = 0
+
+    # Entry direction: "momentum" = buy YES (follow the spike direction),
+    # "contrarian" = sell YES / buy NO (bet on mean reversion).
+    entry_direction: str = "momentum"
+
     # Filters
     news_filter_enabled: bool = True
 

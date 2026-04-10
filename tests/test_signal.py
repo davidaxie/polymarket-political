@@ -15,6 +15,7 @@ from polymarket_political.signal.features import (
     compute_1h_price_move,
     compute_taker_imbalance,
     rolling_hourly_volume,
+    rolling_hourly_volatility,
 )
 
 
@@ -99,6 +100,60 @@ def test_compute_taker_imbalance():
     out = compute_taker_imbalance(trades, window="1h")
     # 300 buy vs 100 sell -> (300-100)/400 = 0.5
     assert out.iloc[0]["imbalance"] == pytest.approx(0.5)
+
+
+def test_rolling_hourly_volatility_basic():
+    """Volatility spikes when price jumps, stays low when flat."""
+    ts = pd.date_range("2026-04-01", periods=120, freq="1min", tz="UTC")
+    # First 60 min: flat 0.50
+    # Next 60 min: jumping between 0.40 and 0.60 every minute
+    prices_flat = [0.50] * 60
+    prices_volatile = [0.40 if i % 2 == 0 else 0.60 for i in range(60)]
+    prices_all = prices_flat + prices_volatile
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "market_id": ["m1"] * 120,
+        "mid_price": prices_all,
+    })
+    out = rolling_hourly_volatility(df, window="2h")
+    assert "hourly_volatility" in out.columns
+    assert "volatility_ratio" in out.columns
+    assert len(out) == 2
+    # Second hour should be much more volatile than first.
+    assert out.iloc[1]["hourly_volatility"] > out.iloc[0]["hourly_volatility"] * 5
+
+
+def test_rolling_hourly_volatility_empty():
+    out = rolling_hourly_volatility(pd.DataFrame(), window="7d")
+    assert out.empty
+    assert "volatility_ratio" in out.columns
+
+
+def test_prices_only_detector():
+    """Prices-only 2-factor detector fires on volatility spike + price move."""
+    df = pd.DataFrame([{
+        "market_id": "m1",
+        "timestamp": pd.Timestamp("2026-04-01T10:00", tz="UTC"),
+        "volatility_ratio": 5.0,
+        "abs_price_move": 0.08,
+    }])
+    cfg = SignalConfig(signal_mode="prices_only", volatility_multiplier=3.0,
+                       price_move_threshold=0.05)
+    events = detect_events(df, cfg)
+    assert len(events) == 1
+    assert events[0].volume_ratio == 5.0  # mapped from volatility_ratio
+
+
+def test_prices_only_detector_no_fire_low_vol():
+    """Low volatility ratio should not fire even with price move."""
+    df = pd.DataFrame([{
+        "market_id": "m1",
+        "timestamp": pd.Timestamp("2026-04-01T10:00", tz="UTC"),
+        "volatility_ratio": 1.5,
+        "abs_price_move": 0.10,
+    }])
+    cfg = SignalConfig(signal_mode="prices_only", volatility_multiplier=3.0)
+    assert detect_events(df, cfg) == []
 
 
 # ---------------------------------------------------------------------------

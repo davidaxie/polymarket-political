@@ -396,7 +396,8 @@ def run_backtest(
     for row in markets_df.itertuples(index=False):
         market_id = getattr(row, "market_id", "")
         condition_id = getattr(row, "condition_id", "") or market_id
-        token_ids = list(getattr(row, "token_ids", []) or [])
+        _raw_tids = getattr(row, "token_ids", None)
+        token_ids = list(_raw_tids) if _raw_tids is not None and len(_raw_tids) > 0 else []
         # YES-token is conventionally the first token id.
         yes_token = token_ids[0] if token_ids else market_id
 
@@ -448,21 +449,35 @@ def run_backtest(
     log.info("detected %d events", len(events))
 
     # 4. Simulate trades (provisional cost path).
+    #    Apply entry_delay: shift the entry timestamp forward by N hours.
+    #    Apply entry_direction: "contrarian" inverts the PnL (short YES).
+    entry_delay = pd.Timedelta(hours=sig_cfg.entry_delay_hours)
+    is_contrarian = sig_cfg.entry_direction == "contrarian"
+
     ledger: list[Trade] = []
     for idx, event in enumerate(events):
         prices = prices_by_market.get(event.market_id, pd.DataFrame())
-        entry_price = _entry_price_for_event(event, prices)
+
+        # Shift entry time if delayed
+        delayed_event = Event(
+            market_id=event.market_id,
+            timestamp=event.timestamp + entry_delay,
+            volume_ratio=event.volume_ratio,
+            abs_price_move=event.abs_price_move,
+            imbalance=event.imbalance,
+        )
+        entry_price = _entry_price_for_event(delayed_event, prices)
         if entry_price is None or entry_price <= 0:
             warnings.append(
                 f"skipped event {event.market_id}@{event.timestamp}: no entry price"
             )
             continue
-        market_data = _market_data_for_event(event, prices)
+        market_data = _market_data_for_event(delayed_event, prices)
         trade = simulate_trade_provisional(
             event={
                 "event_id": f"sig::{idx}::{event.market_id}",
                 "market_id": event.market_id,
-                "entry_ts": float(event.timestamp.timestamp()),
+                "entry_ts": float(delayed_event.timestamp.timestamp()),
                 "entry_price": entry_price,
                 "size_usd": bt_cfg.default_size_usd,
             },
@@ -470,6 +485,22 @@ def run_backtest(
             config=prov_cost_cfg,
             bt_config=bt_cfg,
         )
+
+        # Contrarian: flip PnL signs (short YES position)
+        if is_contrarian:
+            trade = Trade(
+                **{
+                    **trade.to_dict(),
+                    "pnl_gross_24h": -trade.pnl_gross_24h,
+                    "pnl_gross_48h": -trade.pnl_gross_48h,
+                    "pnl_gross_72h": -trade.pnl_gross_72h,
+                    "pnl_gross_resolution": -trade.pnl_gross_resolution,
+                    "pnl_net_24h": -trade.pnl_gross_24h - abs(trade.pnl_net_24h - trade.pnl_gross_24h),
+                    "pnl_net_48h": -trade.pnl_gross_48h - abs(trade.pnl_net_48h - trade.pnl_gross_48h),
+                    "pnl_net_72h": -trade.pnl_gross_72h - abs(trade.pnl_net_72h - trade.pnl_gross_72h),
+                    "pnl_net_resolution": -trade.pnl_gross_resolution - abs(trade.pnl_net_resolution - trade.pnl_gross_resolution),
+                }
+            )
         ledger.append(trade)
 
     # 5. Control group — volume-quartile matched random markets + timestamps.
